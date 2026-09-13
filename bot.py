@@ -38,7 +38,7 @@ def run_bot():
     bot.infinity_polling()
 
 # Run both the web server and the bot simultaneously
-if name == "main":
+if __name__ == "__main__":
     Thread(target=run_bot).start()
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
