@@ -27,7 +27,7 @@ def handle_message(message):
         bot.reply_to(message, "Sorry, I ran into an error.")
 
 # Create a fake web server to satisfy Render's requirements
-app = Flask(name)
+app = Flask(__name__)
 
 @app.route('/')
 def home():
