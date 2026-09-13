@@ -9,7 +9,6 @@ GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
 
-# Initialize Groq client using OpenAI compatibility
 client = OpenAI(
     api_key=GROQ_API_KEY,
     base_url="https://api.groq.com/openai/v1"
@@ -29,9 +28,9 @@ def handle_message(message):
     try:
         bot.send_chat_action(message.chat.id, 'typing')
         
-        # Call Groq API (completely free tier)
+        # Switched to llama-3.3-70b-versatile which is fully supported on the free tier
         response = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
+            model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": system_rules},
                 {"role": "user", "content": message.text}
