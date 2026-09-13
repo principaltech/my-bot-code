@@ -24,7 +24,7 @@ def handle_message(message):
         # Send reply
         bot.reply_to(message, ai_response.text)
     except Exception as e:
-        bot.reply_to(message, "Sorry, I ran into an error.")
+        bot.reply_to(message, str(e))
 
 # Create a fake web server to satisfy Render's requirements
 app = Flask(__name__)
