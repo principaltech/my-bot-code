@@ -5,10 +5,15 @@ from threading import Thread
 from openai import OpenAI
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
-DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
-client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
+
+# Initialize Groq client using OpenAI compatibility
+client = OpenAI(
+    api_key=GROQ_API_KEY,
+    base_url="https://api.groq.com/openai/v1"
+)
 
 system_rules = """
 You are an automated customer care AI assistant for Splash Internet, a prepaid Wi-Fi network. You MUST follow these rules strictly:
@@ -23,16 +28,20 @@ You are an automated customer care AI assistant for Splash Internet, a prepaid W
 def handle_message(message):
     try:
         bot.send_chat_action(message.chat.id, 'typing')
+        
+        # Call Groq API (completely free tier)
         response = client.chat.completions.create(
-            model="deepseek-chat",
+            model="llama-3.1-8b-instant",
             messages=[
                 {"role": "system", "content": system_rules},
                 {"role": "user", "content": message.text}
             ],
             stream=False
         )
+        
         ai_reply = response.choices[0].message.content
         bot.reply_to(message, ai_reply)
+        
     except Exception as e:
         bot.reply_to(message, f"Error: {str(e)}")
 
@@ -40,7 +49,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Splash Internet Bot is awake and running on DeepSeek!"
+    return "Splash Internet Bot is awake and running on Groq free tier!"
 
 def run_bot():
     bot.infinity_polling()
