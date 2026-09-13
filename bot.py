@@ -29,7 +29,7 @@ def handle_message(message):
         bot.send_chat_action(message.chat.id, 'typing')
         
         response = client.chat.completions.create(
-            model="llama-3.1-8b-instant",
+            model="llama-3.3-70b-versatile",
             messages=[
                 {"role": "system", "content": system_rules},
                 {"role": "user", "content": message.text}
