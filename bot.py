@@ -8,8 +8,6 @@ TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 DEEPSEEK_API_KEY = os.environ.get("DEEPSEEK_API_KEY")
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
-
-# Initialize DeepSeek client using OpenAI compatibility
 client = OpenAI(api_key=DEEPSEEK_API_KEY, base_url="https://api.deepseek.com")
 
 system_rules = """
@@ -25,8 +23,6 @@ You are an automated customer care AI assistant for Splash Internet, a prepaid W
 def handle_message(message):
     try:
         bot.send_chat_action(message.chat.id, 'typing')
-        
-        # Call DeepSeek API
         response = client.chat.completions.create(
             model="deepseek-chat",
             messages=[
@@ -35,14 +31,12 @@ def handle_message(message):
             ],
             stream=False
         )
-        
         ai_reply = response.choices[0].message.content
         bot.reply_to(message, ai_reply)
-        
     except Exception as e:
         bot.reply_to(message, f"Error: {str(e)}")
 
-app = Flask(name)
+app = Flask(__name__)
 
 @app.route('/')
 def home():
@@ -51,7 +45,7 @@ def home():
 def run_bot():
     bot.infinity_polling()
 
-if name == "main":
+if __name__ == "__main__":
     Thread(target=run_bot).start()
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
