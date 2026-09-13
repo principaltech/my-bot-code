@@ -2,17 +2,13 @@ import telebot
 import os
 from flask import Flask
 from threading import Thread
-from openai import OpenAI
+from groq import Groq
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
 bot = telebot.TeleBot(TELEGRAM_TOKEN)
-
-client = OpenAI(
-    api_key=GROQ_API_KEY,
-    base_url="https://api.groq.com/openai/v1"
-)
+client = Groq(api_key=GROQ_API_KEY)
 
 system_rules = """
 You are an automated customer care AI assistant for Splash Internet, a prepaid Wi-Fi network. You MUST follow these rules strictly:
@@ -28,16 +24,18 @@ def handle_message(message):
     try:
         bot.send_chat_action(message.chat.id, 'typing')
         
-        response = client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
+        completion = client.chat.completions.create(
+            model="openai/gpt-oss-120b",
             messages=[
                 {"role": "system", "content": system_rules},
                 {"role": "user", "content": message.text}
             ],
-            stream=False
+            temperature=1,
+            max_completion_tokens=2048,
+            top_p=1
         )
         
-        ai_reply = response.choices[0].message.content
+        ai_reply = completion.choices[0].message.content
         bot.reply_to(message, ai_reply)
         
     except Exception as e:
