@@ -79,10 +79,27 @@ user_last_message_id = {}  # Tracks the user's last message ID for highlighting 
 admin_chat_id = None
 
 # Tracks customers currently waiting on a voucher approval, keyed by chat_id:
-#   {"code_ending": "...", "price": "...", "phone": "...", "package": "..."}
+#   {"code_ending": "...", "price": "...", "phone": "...", "package": "...",
+#    "proposed_code": "..." or None, "package_key": "..." or None}
 # This lets the admin bot match a reply to the correct customer instantly
 # instead of asking the AI to guess across every open chat.
 pending_approvals = {}
+
+# Package reference (price + data), mirrors the pricing table below.
+PACKAGES = {
+    "24 HOURS LITE": {"price": "$1.00", "data": "UNLIMITED"},
+    "2 DAYS": {"price": "$0.50", "data": "5GB"},
+    "7 DAYS": {"price": "$1.00", "data": "12GB"},
+    "3 DAYS LITE": {"price": "$2.00", "data": "UNLIMITED"},
+    "14 DAYS PRO": {"price": "$5.00", "data": "UNLIMITED"},
+    "30 DAYS LITE": {"price": "$10.00", "data": "UNLIMITED"},
+    "30 DAYS PRO": {"price": "$20.00", "data": "UNLIMITED"},
+}
+
+# Voucher stock: package name -> list of unused codes (FIFO queue).
+# Admin stocks these ahead of time via "ADD CODE <code> FOR <package>".
+voucher_inventory = {pkg: [] for pkg in PACKAGES}
+_inventory_lock = Lock()
 
 system_rules = """
 You are an automated customer care AI assistant for Splash Internet. You MUST follow these rules strictly:
@@ -102,10 +119,10 @@ You are an automated customer care AI assistant for Splash Internet. You MUST fo
 4. AFTER PAYMENT PROOF IS SUBMITTED:
    - Tell the user to wait 30 seconds while the payment is validated.
 5. ADMIN PAYMENT APPROVAL (CRITICAL INSTRUCTION):
-   - When a user submits proof of payment, check your memory. If you DO NOT have a stored, unused voucher for their package, you must ask the admin to provide one.
-   - You MUST generate the exact tag [ADMIN_ALERT] followed immediately by a structured line in EXACTLY this format (pipe-separated, one line, then your own short note after a dash):
+   - When a user submits proof of payment, you MUST generate the exact tag [ADMIN_ALERT] followed immediately by a structured line in EXACTLY this format (pipe-separated, one line, then your own short note after a dash):
      [ADMIN_ALERT] CODE_ENDING: <last 4 digits of their transaction/reference> | PRICE: $<amount> | PHONE: <customer phone number> | PACKAGE: <package name> - Admin, please provide a voucher code.
    - Fill in every field. If the customer never gave you a transaction reference, use their phone number's last 4 digits for CODE_ENDING instead, and say so in your note.
+   - The system automatically checks real voucher stock for you - you do not need to track or remember whether a code is available. Just always send an accurate alert; the backend and admin decide what happens next.
    - NEVER tell the user you forwarded the payment without including this exact [ADMIN_ALERT] structured line.
 6. ADMIN REPLIES & RAW VOUCHER CODES:
    - You will receive a system message if the admin replies: "[SYSTEM NOTIFICATION - ADMIN REPLIED]: <message>".
@@ -158,6 +175,45 @@ def find_target_customer(admin_text):
     return None
 
 
+def normalize_package(text):
+    """Match free-text package name (from admin or AI) to a known PACKAGES key."""
+    if not text:
+        return None
+    t = re.sub(r'\s+', ' ', text.strip()).upper()
+    if t in PACKAGES:
+        return t
+    candidates = [k for k in PACKAGES if t in k or k in t]
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def reserve_voucher(package_key):
+    """Pop the next available stored code for a package, or None if out of stock."""
+    if not package_key:
+        return None
+    with _inventory_lock:
+        codes = voucher_inventory.get(package_key)
+        if codes:
+            return codes.pop(0)
+    return None
+
+
+def return_voucher(package_key, code):
+    """Put a reserved code back at the front of the queue (e.g. admin said NO)."""
+    if not package_key or not code:
+        return
+    with _inventory_lock:
+        voucher_inventory.setdefault(package_key, []).insert(0, code)
+
+
+ADD_CODE_PATTERN = re.compile(
+    r'^\s*add\s+code\s+(?P<code>\S+)\s+for\s+(?P<package>.+?)\s*$',
+    re.IGNORECASE
+)
+
+YES_WORDS = {"yes", "y", "approve", "approved", "ok", "okay", "confirm", "confirmed"}
+NO_WORDS = {"no", "n", "reject", "rejected", "cancel", "deny", "denied"}
+
+
 # ==========================================
 # BOT 1: CUSTOMER BOT HANDLER
 # ==========================================
@@ -194,19 +250,39 @@ def handle_customer_message(message):
                     parsed = parse_admin_alert(alert_text)
                     if parsed:
                         pending_approvals[chat_id] = parsed
-                        admin_msg = (
-                            f"🔔 NEW PAYMENT APPROVAL REQUEST\n"
-                            f"Customer ID: {chat_id}\n"
-                            f"Code ending: {parsed['code_ending']}\n"
-                            f"Price: {parsed['price']}\n"
-                            f"Phone: {parsed['phone']}\n"
-                            f"Package: {parsed['package']}\n\n"
-                            f"Reply with the voucher code to approve, or 'no' to reject."
-                        )
+                        pkg_key = normalize_package(parsed['package'])
+                        reserved_code = reserve_voucher(pkg_key)
+                        pending_approvals[chat_id]["package_key"] = pkg_key
+                        pending_approvals[chat_id]["proposed_code"] = reserved_code
+
+                        if reserved_code:
+                            admin_msg = (
+                                f"🔔 PAYMENT APPROVAL — STOCK CODE AVAILABLE\n"
+                                f"Customer ID: {chat_id}\n"
+                                f"Code ending: {parsed['code_ending']}\n"
+                                f"Price: {parsed['price']}\n"
+                                f"Phone: {parsed['phone']}\n"
+                                f"Package: {parsed['package']}\n\n"
+                                f"Stored voucher found: {reserved_code}\n"
+                                f"Reply YES to send it to the customer, or NO to hold it and provide a different code."
+                            )
+                        else:
+                            admin_msg = (
+                                f"🔔 NEW PAYMENT APPROVAL REQUEST — OUT OF STOCK\n"
+                                f"Customer ID: {chat_id}\n"
+                                f"Code ending: {parsed['code_ending']}\n"
+                                f"Price: {parsed['price']}\n"
+                                f"Phone: {parsed['phone']}\n"
+                                f"Package: {parsed['package']}\n\n"
+                                f"No stored code for this package. Reply with a new voucher code to approve, or 'no' to reject."
+                            )
                     else:
                         # AI didn't follow the structured format - still track them as
                         # pending so a lone admin reply can reach them, and forward raw text.
-                        pending_approvals[chat_id] = {"code_ending": "", "price": "", "phone": "", "package": ""}
+                        pending_approvals[chat_id] = {
+                            "code_ending": "", "price": "", "phone": "", "package": "",
+                            "package_key": None, "proposed_code": None
+                        }
                         admin_msg = f"🔔 ADMIN ALERT (Customer ID: {chat_id}):\n{alert_text}"
                     admin_bot.send_message(admin_chat_id, admin_msg)
             else:
@@ -236,6 +312,41 @@ def handle_admin_message(message):
         admin_bot.reply_to(message, f"✅ Admin Link Active! (Your ID: {admin_chat_id})\nReady to receive and route vouchers.")
         return
 
+    # --- Inventory: view stock ---
+    if text.strip().lower() in ['stock', '/stock', 'inventory', '/inventory']:
+        lines = [
+            f"- {pkg} ({info['price']}, {info['data']}): {len(voucher_inventory.get(pkg, []))} code(s)"
+            for pkg, info in PACKAGES.items()
+        ]
+        admin_bot.reply_to(message, "📦 Voucher stock:\n" + "\n".join(lines))
+        return
+
+    # --- Inventory: add code(s), one per line: "ADD CODE <code> FOR <package>" ---
+    add_matches = [m for m in (ADD_CODE_PATTERN.match(line) for line in text.splitlines()) if m]
+    if add_matches:
+        added, failed = [], []
+        for m in add_matches:
+            code = m.group("code").strip()
+            pkg_input = m.group("package").strip()
+            pkg_key = normalize_package(pkg_input)
+            if pkg_key:
+                with _inventory_lock:
+                    voucher_inventory.setdefault(pkg_key, []).append(code)
+                added.append(f"{code} → {pkg_key} ({PACKAGES[pkg_key]['price']}, {PACKAGES[pkg_key]['data']})")
+            else:
+                failed.append(f"{code} (unrecognized package '{pkg_input}')")
+
+        reply_parts = []
+        if added:
+            reply_parts.append("✅ Added to stock:\n" + "\n".join(added))
+        if failed:
+            reply_parts.append(
+                "⚠️ Could not match package for:\n" + "\n".join(failed) +
+                "\n\nKnown packages: " + ", ".join(PACKAGES.keys())
+            )
+        admin_bot.reply_to(message, "\n\n".join(reply_parts))
+        return
+
     # Deterministically find who this reply is for, instead of asking the AI
     # to guess across every open chat (slow + unreliable). This is the fix
     # for delivery failing/lagging on approval.
@@ -257,6 +368,54 @@ def handle_admin_message(message):
             )
         return
 
+    info = pending_approvals.get(target_cid, {})
+
+    # --- A stored voucher was already proposed for this customer: just needs YES/NO ---
+    if info.get("proposed_code"):
+        decision = text.strip().lower()
+
+        if decision in YES_WORDS:
+            code = info["proposed_code"]
+            package = info.get("package") or "your package"
+            voucher_message = (
+                f"✅ Your payment has been approved!\n\n"
+                f"Package: {package}\n"
+                f"Voucher code: {code}\n\n"
+                "Do not close this current chat, otherwise you might not receive your login code, "
+                "token, or password because the chat ID changes."
+            )
+            history = user_memory.setdefault(target_cid, [{"role": "system", "content": system_rules}])
+            history.append({"role": "assistant", "content": voucher_message})
+
+            reply_id = user_last_message_id.get(target_cid)
+            if reply_id:
+                customer_bot.send_message(target_cid, voucher_message, reply_to_message_id=reply_id)
+            else:
+                customer_bot.send_message(target_cid, voucher_message)
+
+            admin_bot.reply_to(message, f"✅ Delivered stored code '{code}' to Customer {target_cid} instantly.")
+            pending_approvals.pop(target_cid, None)
+            return
+
+        elif decision in NO_WORDS:
+            return_voucher(info.get("package_key"), info["proposed_code"])
+            pending_approvals[target_cid]["proposed_code"] = None
+            admin_bot.reply_to(
+                message,
+                f"↩️ Put that code back in stock. Customer {target_cid} is still waiting — "
+                "please reply with a different voucher code for them."
+            )
+            return
+
+        else:
+            admin_bot.reply_to(
+                message,
+                f"❓ Customer {target_cid} has a stored code ('{info['proposed_code']}') awaiting your confirmation. "
+                "Reply exactly YES to send it, or NO to put it back in stock."
+            )
+            return
+
+    # --- No stored code (out of stock): admin is providing a fresh voucher manually ---
     history = user_memory.get(target_cid)
     if not history:
         admin_bot.reply_to(message, f"⚠️ Could not find chat history for customer {target_cid}.")
