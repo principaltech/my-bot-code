@@ -16,6 +16,7 @@ client = Groq(api_key=GROQ_API_KEY)
 
 # Storage
 user_memory = {}
+user_last_message_id = {}  # NEW: Tracks the user's last message ID for highlighting replies
 admin_chat_id = None
 
 system_rules = """
@@ -36,13 +37,16 @@ You are an automated customer care AI assistant for Splash Internet. You MUST fo
 4. AFTER PAYMENT PROOF IS SUBMITTED:
    - Tell the user to wait 30 seconds while the payment is validated.
 5. ADMIN PAYMENT APPROVAL (CRITICAL INSTRUCTION):
-   - ONLY an explicit YES from the admin authorizes a voucher.
-   - When a user submits proof of payment, you MUST generate the exact tag [ADMIN_ALERT] to notify the admin.
-   - Example format: [ADMIN_ALERT] User submitted proof of payment. Approval code ending: XXXX. Approve payment? YES or NO.
-   - NEVER tell the user you forwarded the payment without also including the [ADMIN_ALERT] tag in your response.
-6. ADMIN YES/NO RULE & VOUCHERS:
-   - You will receive a system message if the admin replies: "[SYSTEM NOTIFICATION - ADMIN REPLIED]: YES XXXX".
-   - If YES, you may issue a voucher. If NO, reject it.
+   - When a user submits proof of payment, check your memory. If you DO NOT have a stored, unused voucher for their package, you must ask the admin to provide one.
+   - You MUST generate the exact tag [ADMIN_ALERT] to notify the admin secretly.
+   - Example format: [ADMIN_ALERT] User submitted proof of payment. Approval code ending: XXXX. Package: YYYY. Admin, please provide a voucher code for this package, or reply NO to reject.
+   - If you DO have vouchers stored already, just ask: Approve payment? YES or NO.
+   - NEVER tell the user you forwarded the payment without including the [ADMIN_ALERT] tag.
+6. ADMIN REPLIES & VOUCHERS:
+   - You will receive a system message if the admin replies: "[SYSTEM NOTIFICATION - ADMIN REPLIED]: <message>".
+   - If the admin replies with a voucher code, consider the payment APPROVED. Issue the voucher to the user and mark it USED.
+   - If the admin replies NO, reject the payment.
+   - IMPORTANT: If the admin's reply is meant for a DIFFERENT customer's approval code, ignore it completely and output only the exact word: [IGNORE_ADMIN]
 7. MANDATORY CLOSING WARNING:
    - You MUST include this exact warning at the end of EVERY customer response: "Do not close this current chat, otherwise you might not receive your login code, token, or password because the chat ID changes."
 8. SCOPE: Only answer about Splash Internet.
@@ -55,6 +59,9 @@ You are an automated customer care AI assistant for Splash Internet. You MUST fo
 def handle_customer_message(message):
     chat_id = message.chat.id
     text = message.text or ""
+    
+    # Save the ID of the user's message so the bot can "highlight/reply" to it later
+    user_last_message_id[chat_id] = message.message_id
 
     if chat_id not in user_memory:
         user_memory[chat_id] = [{"role": "system", "content": system_rules}]
@@ -72,7 +79,6 @@ def handle_customer_message(message):
         )
         ai_reply = completion.choices[0].message.content
         
-        # Use Regex to extract alerts anywhere in the text, and remove them from the customer's view
         alerts = re.findall(r'\[ADMIN_ALERT\](.*)', ai_reply, re.IGNORECASE)
         clean_reply = re.sub(r'\[ADMIN_ALERT\].*', '', ai_reply, flags=re.IGNORECASE).strip()
         
@@ -81,14 +87,13 @@ def handle_customer_message(message):
                 for alert in alerts:
                     admin_bot.send_message(admin_chat_id, f"🔔 ADMIN ALERT (Customer ID: {chat_id}):\n{alert.strip()}")
             else:
-                # FAILSAFE: If you haven't linked the admin bot yet, it warns you directly in the customer chat
                 clean_reply += "\n\n⚠️ SYSTEM NOTIFICATION: The Admin Bot is currently unlinked. (Admin: Please send /start to the Admin bot to reconnect routing)."
 
         if clean_reply:
             user_memory[chat_id].append({"role": "assistant", "content": ai_reply}) 
+            # Highlight/Reply directly to the customer's message
             customer_bot.reply_to(message, clean_reply)
 
-        # Cap memory to avoid token limits
         if len(user_memory[chat_id]) > 15:
             user_memory[chat_id] = [user_memory[chat_id][0]] + user_memory[chat_id][-14:]
             
@@ -102,37 +107,47 @@ def handle_customer_message(message):
 @admin_bot.message_handler(func=lambda message: True)
 def handle_admin_message(message):
     global admin_chat_id
-    admin_chat_id = message.chat.id # Locks onto your admin ID
+    admin_chat_id = message.chat.id 
     text = message.text or ""
     
-    # Confirm linkage to the admin
-    admin_bot.reply_to(message, f"✅ Admin Link Active! (Your ID: {admin_chat_id})\nCommand received: {text}")
+    admin_bot.reply_to(message, f"✅ Admin Link Active! Command processed: {text}")
 
-    # Only inject into the AI memory if it looks like an approval or voucher command
-    if "YES" in text.upper() or "NO" in text.upper() or "VOUCHER" in text.upper():
-        for cid, history in user_memory.items():
-            history.append({
-                "role": "system", 
-                "content": f"[SYSTEM NOTIFICATION - ADMIN REPLIED]: {text}"
-            })
+    # Inject the Admin's command silently into all active customer memories
+    for cid, history in user_memory.items():
+        history.append({
+            "role": "system", 
+            "content": f"[SYSTEM NOTIFICATION - ADMIN REPLIED]: {text}"
+        })
+        
+        try:
+            completion = client.chat.completions.create(
+                model="openai/gpt-oss-120b",
+                messages=history,
+                temperature=1,
+                max_completion_tokens=2048,
+                top_p=1
+            )
+            ai_reply = completion.choices[0].message.content
             
-            # Automatically trigger the AI to tell the customer the good/bad news
-            try:
-                completion = client.chat.completions.create(
-                    model="openai/gpt-oss-120b",
-                    messages=history,
-                    temperature=1,
-                    max_completion_tokens=2048,
-                    top_p=1
-                )
-                ai_reply = completion.choices[0].message.content
-                clean_reply = re.sub(r'\[ADMIN_ALERT\].*', '', ai_reply, flags=re.IGNORECASE).strip()
+            # If the AI realizes this admin message belongs to a different customer, it will say [IGNORE_ADMIN]
+            if "[IGNORE_ADMIN]" in ai_reply:
+                # Remove the irrelevant system notification from this customer's memory so it doesn't confuse them later
+                history.pop()
+                continue
+            
+            clean_reply = re.sub(r'\[ADMIN_ALERT\].*', '', ai_reply, flags=re.IGNORECASE).strip()
+            
+            if clean_reply:
+                history.append({"role": "assistant", "content": ai_reply})
                 
-                if clean_reply:
-                    history.append({"role": "assistant", "content": ai_reply})
+                # Retrieve the customer's last message ID to highlight it in the reply
+                reply_id = user_last_message_id.get(cid)
+                if reply_id:
+                    customer_bot.send_message(cid, clean_reply, reply_to_message_id=reply_id)
+                else:
                     customer_bot.send_message(cid, clean_reply)
-            except Exception as e:
-                pass
+        except Exception as e:
+            pass
 
 
 # ==========================================
