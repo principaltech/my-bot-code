@@ -78,6 +78,12 @@ user_memory = {}
 user_last_message_id = {}  # Tracks the user's last message ID for highlighting replies
 admin_chat_id = None
 
+# Tracks customers currently waiting on a voucher approval, keyed by chat_id:
+#   {"code_ending": "...", "price": "...", "phone": "...", "package": "..."}
+# This lets the admin bot match a reply to the correct customer instantly
+# instead of asking the AI to guess across every open chat.
+pending_approvals = {}
+
 system_rules = """
 You are an automated customer care AI assistant for Splash Internet. You MUST follow these rules strictly:
 
@@ -92,14 +98,15 @@ You are an automated customer care AI assistant for Splash Internet. You MUST fo
    - 30 DAYS PRO = USD $20.00 = UNLIMITED
 3. PAYMENTS & PROOF OF PAYMENT:
    - EcoCash number is 0776248396.
-   - Request customer phone number and proof of payment in this chat.
+   - Before doing anything else, you MUST collect ALL THREE of these from the customer: (a) their phone number, (b) the package they want (so you know the price), and (c) proof of payment (e.g. an EcoCash confirmation message or the last 4 digits of the transaction/reference). Do not generate an admin alert until you have all three.
 4. AFTER PAYMENT PROOF IS SUBMITTED:
    - Tell the user to wait 30 seconds while the payment is validated.
 5. ADMIN PAYMENT APPROVAL (CRITICAL INSTRUCTION):
    - When a user submits proof of payment, check your memory. If you DO NOT have a stored, unused voucher for their package, you must ask the admin to provide one.
-   - You MUST generate the exact tag [ADMIN_ALERT] to notify the admin secretly.
-   - Example format: [ADMIN_ALERT] User submitted proof of payment. Approval code ending: XXXX. Package: YYYY. Admin, please provide a voucher code.
-   - NEVER tell the user you forwarded the payment without including the [ADMIN_ALERT] tag.
+   - You MUST generate the exact tag [ADMIN_ALERT] followed immediately by a structured line in EXACTLY this format (pipe-separated, one line, then your own short note after a dash):
+     [ADMIN_ALERT] CODE_ENDING: <last 4 digits of their transaction/reference> | PRICE: $<amount> | PHONE: <customer phone number> | PACKAGE: <package name> - Admin, please provide a voucher code.
+   - Fill in every field. If the customer never gave you a transaction reference, use their phone number's last 4 digits for CODE_ENDING instead, and say so in your note.
+   - NEVER tell the user you forwarded the payment without including this exact [ADMIN_ALERT] structured line.
 6. ADMIN REPLIES & RAW VOUCHER CODES:
    - You will receive a system message if the admin replies: "[SYSTEM NOTIFICATION - ADMIN REPLIED]: <message>".
    - The admin might just reply with a raw code (e.g., "6786gfr"). 
@@ -110,6 +117,46 @@ You are an automated customer care AI assistant for Splash Internet. You MUST fo
    - You MUST include this exact warning at the end of EVERY customer response: "Do not close this current chat, otherwise you might not receive your login code, token, or password because the chat ID changes."
 8. SCOPE: Only answer about Splash Internet.
 """
+
+def parse_admin_alert(alert_text):
+    """
+    Extract CODE_ENDING / PRICE / PHONE / PACKAGE from a structured
+    [ADMIN_ALERT] line. Returns None if the AI didn't follow the format,
+    in which case we fall back to forwarding the raw text.
+    """
+    pattern = re.compile(
+        r'CODE_ENDING:\s*(?P<code>[^|]+)\|\s*PRICE:\s*(?P<price>[^|]+)\|\s*PHONE:\s*(?P<phone>[^|]+)\|\s*PACKAGE:\s*(?P<package>[^\n]+)',
+        re.IGNORECASE
+    )
+    m = pattern.search(alert_text)
+    if not m:
+        return None
+    return {
+        "code_ending": m.group("code").strip(" -\u2014:"),
+        "price": m.group("price").strip(" -\u2014:"),
+        "phone": m.group("phone").strip(" -\u2014:"),
+        "package": re.split(r'[\u2014-]', m.group("package"))[0].strip(),
+    }
+
+
+def find_target_customer(admin_text):
+    """
+    Deterministically match an admin reply to the customer it's for,
+    instead of asking the AI to guess across every open chat.
+    Priority: an explicit code ending mentioned in the admin's message,
+    then (if unambiguous) the single customer currently pending.
+    """
+    digits_in_text = re.findall(r'\d{3,}', admin_text)
+    for cid, info in pending_approvals.items():
+        ending = (info.get("code_ending") or "").strip()
+        if ending and any(ending in d or d in ending for d in digits_in_text):
+            return cid
+
+    if len(pending_approvals) == 1:
+        return next(iter(pending_approvals))
+
+    return None
+
 
 # ==========================================
 # BOT 1: CUSTOMER BOT HANDLER
@@ -143,7 +190,25 @@ def handle_customer_message(message):
         if alerts:
             if admin_chat_id:
                 for alert in alerts:
-                    admin_bot.send_message(admin_chat_id, f"🔔 ADMIN ALERT (Customer ID: {chat_id}):\n{alert.strip()}")
+                    alert_text = alert.strip()
+                    parsed = parse_admin_alert(alert_text)
+                    if parsed:
+                        pending_approvals[chat_id] = parsed
+                        admin_msg = (
+                            f"🔔 NEW PAYMENT APPROVAL REQUEST\n"
+                            f"Customer ID: {chat_id}\n"
+                            f"Code ending: {parsed['code_ending']}\n"
+                            f"Price: {parsed['price']}\n"
+                            f"Phone: {parsed['phone']}\n"
+                            f"Package: {parsed['package']}\n\n"
+                            f"Reply with the voucher code to approve, or 'no' to reject."
+                        )
+                    else:
+                        # AI didn't follow the structured format - still track them as
+                        # pending so a lone admin reply can reach them, and forward raw text.
+                        pending_approvals[chat_id] = {"code_ending": "", "price": "", "phone": "", "package": ""}
+                        admin_msg = f"🔔 ADMIN ALERT (Customer ID: {chat_id}):\n{alert_text}"
+                    admin_bot.send_message(admin_chat_id, admin_msg)
             else:
                 clean_reply += "\n\n⚠️ SYSTEM NOTIFICATION: The Admin Bot is currently unlinked. (Admin: Please send /start to the Admin bot to reconnect routing)."
 
@@ -171,50 +236,75 @@ def handle_admin_message(message):
         admin_bot.reply_to(message, f"✅ Admin Link Active! (Your ID: {admin_chat_id})\nReady to receive and route vouchers.")
         return
 
-    processing_msg = admin_bot.reply_to(message, f"⏳ Processing code/approval: '{text}'\nMatching with a customer...")
-    
-    matched_customer = False
+    # Deterministically find who this reply is for, instead of asking the AI
+    # to guess across every open chat (slow + unreliable). This is the fix
+    # for delivery failing/lagging on approval.
+    target_cid = find_target_customer(text)
 
-    for cid, history in list(user_memory.items()):
-        history.append({
-            "role": "system", 
-            "content": f"[SYSTEM NOTIFICATION - ADMIN REPLIED]: {text}"
-        })
-        
-        try:
-            completion = create_completion(
-                history,
-                model="openai/gpt-oss-120b",
-                temperature=1,
-                max_completion_tokens=2048,
-                top_p=1
+    if target_cid is None:
+        if not pending_approvals:
+            admin_bot.reply_to(message, "⚠️ No customers are currently waiting for approval.")
+        else:
+            pending_list = "\n".join(
+                f"- {cid}: code ending {info.get('code_ending') or '?'}, "
+                f"{info.get('package') or '?'}, phone {info.get('phone') or '?'}"
+                for cid, info in pending_approvals.items()
             )
-            ai_reply = completion.choices[0].message.content
-            
-            # Intelligent filtering: If customer is not waiting, AI outputs [IGNORE_ADMIN]
-            if "[IGNORE_ADMIN]" in ai_reply:
-                history.pop()
-                continue
-            
-            clean_reply = re.sub(r'\[ADMIN_ALERT\].*', '', ai_reply, flags=re.IGNORECASE).strip()
-            
-            if clean_reply:
-                history.append({"role": "assistant", "content": ai_reply})
-                
-                reply_id = user_last_message_id.get(cid)
-                if reply_id:
-                    customer_bot.send_message(cid, clean_reply, reply_to_message_id=reply_id)
-                else:
-                    customer_bot.send_message(cid, clean_reply)
-                
-                admin_bot.send_message(admin_chat_id, f"✅ **SUCCESS!** AI accepted the code '{text}' and successfully delivered it to Customer {cid}.")
-                matched_customer = True
+            admin_bot.reply_to(
+                message,
+                "⚠️ Multiple customers are waiting — please include the code ending to specify which one:\n\n"
+                f"{pending_list}"
+            )
+        return
 
-        except Exception as e:
-            pass
+    history = user_memory.get(target_cid)
+    if not history:
+        admin_bot.reply_to(message, f"⚠️ Could not find chat history for customer {target_cid}.")
+        pending_approvals.pop(target_cid, None)
+        return
 
-    if not matched_customer:
-        admin_bot.send_message(admin_chat_id, "⚠️ **WARNING:** The AI could not match this command to any pending customer transaction. If there are multiple customers waiting, please include the approval code ending (e.g., '9763 6786gfr').")
+    history.append({
+        "role": "system",
+        "content": f"[SYSTEM NOTIFICATION - ADMIN REPLIED]: {text}"
+    })
+
+    try:
+        completion = create_completion(
+            history,
+            model="openai/gpt-oss-120b",
+            temperature=1,
+            max_completion_tokens=2048,
+            top_p=1
+        )
+        ai_reply = completion.choices[0].message.content
+
+        if "[IGNORE_ADMIN]" in ai_reply:
+            history.pop()
+            admin_bot.reply_to(
+                message,
+                f"⚠️ The AI didn't accept this as a valid reply for Customer {target_cid}. "
+                "Please double-check the code ending and try again."
+            )
+            return
+
+        clean_reply = re.sub(r'\[ADMIN_ALERT\].*', '', ai_reply, flags=re.IGNORECASE).strip()
+
+        if clean_reply:
+            history.append({"role": "assistant", "content": ai_reply})
+
+            reply_id = user_last_message_id.get(target_cid)
+            if reply_id:
+                customer_bot.send_message(target_cid, clean_reply, reply_to_message_id=reply_id)
+            else:
+                customer_bot.send_message(target_cid, clean_reply)
+
+            admin_bot.reply_to(message, f"✅ Delivered instantly to Customer {target_cid}.")
+
+        # Whether approved or rejected, this admin reply resolves the pending request.
+        pending_approvals.pop(target_cid, None)
+
+    except Exception as e:
+        admin_bot.reply_to(message, f"⚠️ Error while processing this reply: {e}")
 
 
 # ==========================================
