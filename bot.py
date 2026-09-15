@@ -211,14 +211,35 @@ ADD_CODE_PATTERN = re.compile(
 YES_WORDS = {"yes", "y", "approve", "approved", "ok", "okay", "confirm", "confirmed"}
 NO_WORDS = {"no", "n", "reject", "rejected", "cancel", "deny", "denied"}
 
+# Fallback text-based filter for group/service notices that might arrive as
+# plain text (e.g. "8v77w2 has left") rather than a proper Telegram service
+# event - skip these too instead of spending an AI call on them.
+SERVICE_MESSAGE_PATTERNS = re.compile(
+    r'\b(has left|has joined|joined the group|left the group|was removed|removed from the group|'
+    r'added to the group|pinned a message|changed the group|changed the chat photo)\b',
+    re.IGNORECASE
+)
+
+
+def is_service_message(text):
+    return bool(SERVICE_MESSAGE_PATTERNS.search(text or ""))
+
 
 # ==========================================
 # BOT 1: CUSTOMER BOT HANDLER
 # ==========================================
 @customer_bot.message_handler(func=lambda message: True)
 def handle_customer_message(message):
+    # Telegram routes service events (member joined/left, pinned messages,
+    # stickers, photos, etc.) through this same handler. None of those are
+    # real customer text, so skip them entirely instead of burning an AI call.
+    if message.content_type != 'text' or not (message.text or "").strip():
+        return
+    if is_service_message(message.text):
+        return
+
     chat_id = message.chat.id
-    text = message.text or ""
+    text = message.text.strip()
     
     user_last_message_id[chat_id] = message.message_id
 
@@ -303,8 +324,15 @@ def handle_customer_message(message):
 @admin_bot.message_handler(func=lambda message: True)
 def handle_admin_message(message):
     global admin_chat_id
-    admin_chat_id = message.chat.id 
-    text = message.text or ""
+
+    # Same guard as the customer bot: ignore joins/leaves/stickers/etc.
+    if message.content_type != 'text' or not (message.text or "").strip():
+        return
+    if is_service_message(message.text):
+        return
+
+    admin_chat_id = message.chat.id
+    text = message.text.strip()
     
     if text.lower() in ['/start', 'hello', 'hi', 'link']:
         admin_bot.reply_to(message, f"✅ Admin Link Active! (Your ID: {admin_chat_id})\nReady to receive and route vouchers.")
