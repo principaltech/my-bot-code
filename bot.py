@@ -115,7 +115,9 @@ You are an automated customer care AI assistant for Splash Internet. You MUST fo
    - 30 DAYS PRO = USD $20.00 = UNLIMITED
 3. PAYMENTS & PROOF OF PAYMENT:
    - EcoCash number is 0776248396.
-   - Before doing anything else, you MUST collect ALL THREE of these from the customer: (a) their phone number, (b) the package they want (so you know the price), and (c) proof of payment (e.g. an EcoCash confirmation message or the last 4 digits of the transaction/reference). Do not generate an admin alert until you have all three.
+   - You need three things: (a) the customer's phone number, (b) the package, and (c) proof of payment (a confirmation message or the last 4 digits of the transaction/reference).
+   - The package can be stated directly by the customer, OR inferred from the amount they paid. If the amount matches EXACTLY ONE package price, treat that as confirmed automatically - do NOT ask the customer to confirm it again, that wastes their time. Just state which package you matched them to and move straight on to rule 4 and rule 5 in the same reply.
+   - Only ask a clarifying question about the package if the amount paid matches more than one package price (e.g. $1.00 = both 24 HOURS LITE and 7 DAYS) or matches no known price at all.
 4. AFTER PAYMENT PROOF IS SUBMITTED:
    - Tell the user to wait 30 seconds while the payment is validated.
 5. ADMIN PAYMENT APPROVAL (CRITICAL INSTRUCTION):
@@ -124,12 +126,8 @@ You are an automated customer care AI assistant for Splash Internet. You MUST fo
    - Fill in every field. If the customer never gave you a transaction reference, use their phone number's last 4 digits for CODE_ENDING instead, and say so in your note.
    - The system automatically checks real voucher stock for you - you do not need to track or remember whether a code is available. Just always send an accurate alert; the backend and admin decide what happens next.
    - NEVER tell the user you forwarded the payment without including this exact [ADMIN_ALERT] structured line.
-6. ADMIN REPLIES & RAW VOUCHER CODES:
-   - You will receive a system message if the admin replies: "[SYSTEM NOTIFICATION - ADMIN REPLIED]: <message>".
-   - The admin might just reply with a raw code (e.g., "6786gfr"). 
-   - If you receive a code and THIS customer is currently waiting for a voucher, ASSUME the code is their voucher. Approve the payment, issue the voucher to the user, and mark it USED.
-   - If the admin says NO, reject the payment.
-   - IMPORTANT: If this specific customer is NOT waiting for a payment approval, OR if the admin explicitly mentions a different customer's approval code, you MUST ignore it completely and output ONLY the exact word: [IGNORE_ADMIN]
+6. ADMIN REPLIES:
+   - You will never need to interpret or forward admin replies yourself - the backend now matches the admin's reply to the correct customer and delivers the voucher (or rejection) directly and automatically. You do not need to output [IGNORE_ADMIN] or handle raw codes.
 7. MANDATORY CLOSING WARNING:
    - You MUST include this exact warning at the end of EVERY customer response: "Do not close this current chat, otherwise you might not receive your login code, token, or password because the chat ID changes."
 8. SCOPE: Only answer about Splash Internet.
@@ -416,54 +414,46 @@ def handle_admin_message(message):
             return
 
     # --- No stored code (out of stock): admin is providing a fresh voucher manually ---
-    history = user_memory.get(target_cid)
-    if not history:
-        admin_bot.reply_to(message, f"⚠️ Could not find chat history for customer {target_cid}.")
+    decision = text.strip().lower()
+    history = user_memory.setdefault(target_cid, [{"role": "system", "content": system_rules}])
+    reply_id = user_last_message_id.get(target_cid)
+
+    if decision in NO_WORDS:
+        rejection_message = (
+            "❌ Unfortunately we could not verify your payment. "
+            "Please double-check your proof of payment and try again, or contact support.\n\n"
+            "Do not close this current chat, otherwise you might not receive your login code, "
+            "token, or password because the chat ID changes."
+        )
+        history.append({"role": "assistant", "content": rejection_message})
+        if reply_id:
+            customer_bot.send_message(target_cid, rejection_message, reply_to_message_id=reply_id)
+        else:
+            customer_bot.send_message(target_cid, rejection_message)
+
+        admin_bot.reply_to(message, f"❌ Rejection sent to Customer {target_cid}.")
         pending_approvals.pop(target_cid, None)
         return
 
-    history.append({
-        "role": "system",
-        "content": f"[SYSTEM NOTIFICATION - ADMIN REPLIED]: {text}"
-    })
+    # Anything else the admin sends at this point IS the voucher code - deliver it
+    # directly rather than routing through the AI, so delivery can't fail or stall.
+    code = text.strip()
+    package = info.get("package") or "your package"
+    voucher_message = (
+        f"✅ Your payment has been approved!\n\n"
+        f"Package: {package}\n"
+        f"Voucher code: {code}\n\n"
+        "Do not close this current chat, otherwise you might not receive your login code, "
+        "token, or password because the chat ID changes."
+    )
+    history.append({"role": "assistant", "content": voucher_message})
+    if reply_id:
+        customer_bot.send_message(target_cid, voucher_message, reply_to_message_id=reply_id)
+    else:
+        customer_bot.send_message(target_cid, voucher_message)
 
-    try:
-        completion = create_completion(
-            history,
-            model="openai/gpt-oss-120b",
-            temperature=1,
-            max_completion_tokens=2048,
-            top_p=1
-        )
-        ai_reply = completion.choices[0].message.content
-
-        if "[IGNORE_ADMIN]" in ai_reply:
-            history.pop()
-            admin_bot.reply_to(
-                message,
-                f"⚠️ The AI didn't accept this as a valid reply for Customer {target_cid}. "
-                "Please double-check the code ending and try again."
-            )
-            return
-
-        clean_reply = re.sub(r'\[ADMIN_ALERT\].*', '', ai_reply, flags=re.IGNORECASE).strip()
-
-        if clean_reply:
-            history.append({"role": "assistant", "content": ai_reply})
-
-            reply_id = user_last_message_id.get(target_cid)
-            if reply_id:
-                customer_bot.send_message(target_cid, clean_reply, reply_to_message_id=reply_id)
-            else:
-                customer_bot.send_message(target_cid, clean_reply)
-
-            admin_bot.reply_to(message, f"✅ Delivered instantly to Customer {target_cid}.")
-
-        # Whether approved or rejected, this admin reply resolves the pending request.
-        pending_approvals.pop(target_cid, None)
-
-    except Exception as e:
-        admin_bot.reply_to(message, f"⚠️ Error while processing this reply: {e}")
+    admin_bot.reply_to(message, f"✅ Delivered code '{code}' to Customer {target_cid} instantly.")
+    pending_approvals.pop(target_cid, None)
 
 
 # ==========================================
