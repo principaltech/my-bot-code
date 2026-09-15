@@ -203,8 +203,30 @@ def return_voucher(package_key, code):
         voucher_inventory.setdefault(package_key, []).insert(0, code)
 
 
+def delete_voucher(code, package_key=None):
+    """
+    Remove a specific unused code from inventory (case-insensitive match).
+    If package_key is given, only look there; otherwise search every package.
+    Returns the package_key it was removed from, or None if not found.
+    """
+    with _inventory_lock:
+        search_keys = [package_key] if package_key else list(voucher_inventory.keys())
+        for pkg in search_keys:
+            codes = voucher_inventory.get(pkg, [])
+            for i, c in enumerate(codes):
+                if c.lower() == code.lower():
+                    codes.pop(i)
+                    return pkg
+    return None
+
+
 ADD_CODE_PATTERN = re.compile(
     r'^\s*add\s+code\s+(?P<code>\S+)\s+for\s+(?P<package>.+?)\s*$',
+    re.IGNORECASE
+)
+
+DELETE_CODE_PATTERN = re.compile(
+    r'^\s*delete\s+code\s+(?P<code>\S+)(?:\s+from\s+(?P<package>.+?))?\s*$',
     re.IGNORECASE
 )
 
@@ -338,13 +360,53 @@ def handle_admin_message(message):
         admin_bot.reply_to(message, f"✅ Admin Link Active! (Your ID: {admin_chat_id})\nReady to receive and route vouchers.")
         return
 
-    # --- Inventory: view stock ---
+    # --- Inventory: view stock (counts) or full detail with actual codes ---
     if text.strip().lower() in ['stock', '/stock', 'inventory', '/inventory']:
         lines = [
             f"- {pkg} ({info['price']}, {info['data']}): {len(voucher_inventory.get(pkg, []))} code(s)"
             for pkg, info in PACKAGES.items()
         ]
-        admin_bot.reply_to(message, "📦 Voucher stock:\n" + "\n".join(lines))
+        admin_bot.reply_to(
+            message,
+            "📦 Voucher stock:\n" + "\n".join(lines) +
+            "\n\nSend 'stock full' to see the actual codes."
+        )
+        return
+
+    if text.strip().lower() in ['stock full', 'stock detail', 'list codes', '/codes']:
+        lines = []
+        for pkg, info in PACKAGES.items():
+            codes = voucher_inventory.get(pkg, [])
+            if codes:
+                codes_str = ", ".join(codes)
+            else:
+                codes_str = "(none)"
+            lines.append(f"- {pkg} ({info['price']}, {info['data']}): {codes_str}")
+        admin_bot.reply_to(message, "📦 Voucher stock (detailed):\n" + "\n".join(lines))
+        return
+
+    # --- Inventory: delete code(s), one per line: "DELETE CODE <code> [FROM <package>]" ---
+    delete_matches = [m for m in (DELETE_CODE_PATTERN.match(line) for line in text.splitlines()) if m]
+    if delete_matches:
+        removed, not_found = [], []
+        for m in delete_matches:
+            code = m.group("code").strip()
+            pkg_input = m.group("package")
+            pkg_key = normalize_package(pkg_input.strip()) if pkg_input else None
+            found_pkg = delete_voucher(code, pkg_key)
+            if found_pkg:
+                removed.append(f"{code} (was in {found_pkg})")
+            else:
+                not_found.append(code)
+
+        reply_parts = []
+        if removed:
+            reply_parts.append("🗑️ Removed from stock:\n" + "\n".join(removed))
+        if not_found:
+            reply_parts.append(
+                "⚠️ Not found in stock (already used, wrong package, or typo):\n" + "\n".join(not_found)
+            )
+        admin_bot.reply_to(message, "\n\n".join(reply_parts))
         return
 
     # --- Inventory: add code(s), one per line: "ADD CODE <code> FOR <package>" ---
