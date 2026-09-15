@@ -1,12 +1,13 @@
 import telebot
 import os
+import re
 from flask import Flask
 from threading import Thread
 from groq import Groq
 
-# Pull both bot tokens from Render Environment
-TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")       # Bot 1: For Customers
-ADMIN_BOT_TOKEN = os.environ.get("ADMIN_BOT_TOKEN")     # Bot 2: For You (Admin)
+# Tokens
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")       # Bot 1: Customer Bot
+ADMIN_BOT_TOKEN = os.environ.get("ADMIN_BOT_TOKEN")     # Bot 2: Admin Bot
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
 
 customer_bot = telebot.TeleBot(TELEGRAM_TOKEN)
@@ -18,9 +19,9 @@ user_memory = {}
 admin_chat_id = None
 
 system_rules = """
-You are an automated customer care AI assistant for Splash Internet, a prepaid Wi-Fi network. You MUST follow these rules strictly:
+You are an automated customer care AI assistant for Splash Internet. You MUST follow these rules strictly:
 
-1. LANGUAGE: Support ONLY Shona or English. Match the user's language precisely.
+1. LANGUAGE: Support ONLY Shona or English.
 2. PRICING & PACKAGES:
    - 24 HOURS LITE = USD $1.00 = UNLIMITED
    - 2 DAYS = USD $0.50 = 5GB
@@ -36,8 +37,9 @@ You are an automated customer care AI assistant for Splash Internet, a prepaid W
    - Tell the user to wait 30 seconds while the payment is validated.
 5. ADMIN PAYMENT APPROVAL (CRITICAL INSTRUCTION):
    - ONLY an explicit YES from the admin authorizes a voucher.
-   - To secretly ask the admin, generate a line starting exactly with [ADMIN_ALERT].
-   - Example: [ADMIN_ALERT] User submitted proof of payment. Approval code ending: XXXX. Approve payment? YES or NO.
+   - When a user submits proof of payment, you MUST generate the exact tag [ADMIN_ALERT] to notify the admin.
+   - Example format: [ADMIN_ALERT] User submitted proof of payment. Approval code ending: XXXX. Approve payment? YES or NO.
+   - NEVER tell the user you forwarded the payment without also including the [ADMIN_ALERT] tag in your response.
 6. ADMIN YES/NO RULE & VOUCHERS:
    - You will receive a system message if the admin replies: "[SYSTEM NOTIFICATION - ADMIN REPLIED]: YES XXXX".
    - If YES, you may issue a voucher. If NO, reject it.
@@ -70,67 +72,67 @@ def handle_customer_message(message):
         )
         ai_reply = completion.choices[0].message.content
         
-        customer_reply_lines = []
-        for line in ai_reply.split('\n'):
-            if "[ADMIN_ALERT]" in line:
-                alert_message = line.replace("[ADMIN_ALERT]", "").strip()
-                # Send this alert strictly to the 2nd Admin Bot
-                if admin_chat_id:
-                    admin_bot.send_message(admin_chat_id, f"🔔 ADMIN ALERT (Customer ID: {chat_id}):\n{alert_message}")
+        # Use Regex to extract alerts anywhere in the text, and remove them from the customer's view
+        alerts = re.findall(r'\[ADMIN_ALERT\](.*)', ai_reply, re.IGNORECASE)
+        clean_reply = re.sub(r'\[ADMIN_ALERT\].*', '', ai_reply, flags=re.IGNORECASE).strip()
+        
+        if alerts:
+            if admin_chat_id:
+                for alert in alerts:
+                    admin_bot.send_message(admin_chat_id, f"🔔 ADMIN ALERT (Customer ID: {chat_id}):\n{alert.strip()}")
             else:
-                customer_reply_lines.append(line)
-        
-        safe_customer_reply = "\n".join(customer_reply_lines).strip()
-        
-        if safe_customer_reply:
-            user_memory[chat_id].append({"role": "assistant", "content": ai_reply}) 
-            customer_bot.reply_to(message, safe_customer_reply)
+                # FAILSAFE: If you haven't linked the admin bot yet, it warns you directly in the customer chat
+                clean_reply += "\n\n⚠️ SYSTEM NOTIFICATION: The Admin Bot is currently unlinked. (Admin: Please send /start to the Admin bot to reconnect routing)."
 
+        if clean_reply:
+            user_memory[chat_id].append({"role": "assistant", "content": ai_reply}) 
+            customer_bot.reply_to(message, clean_reply)
+
+        # Cap memory to avoid token limits
         if len(user_memory[chat_id]) > 15:
             user_memory[chat_id] = [user_memory[chat_id][0]] + user_memory[chat_id][-14:]
             
     except Exception as e:
-        customer_bot.reply_to(message, f"Error processing your request.")
+        customer_bot.reply_to(message, f"Error processing request: {str(e)}")
 
 
 # ==========================================
-# BOT 2: ADMIN BOT HANDLER (For mr cool)
+# BOT 2: ADMIN BOT HANDLER
 # ==========================================
 @admin_bot.message_handler(func=lambda message: True)
 def handle_admin_message(message):
     global admin_chat_id
-    admin_chat_id = message.chat.id # Saves your admin chat ID when you message the second bot
+    admin_chat_id = message.chat.id # Locks onto your admin ID
     text = message.text or ""
     
-    # Acknowledge receipt to the admin
-    admin_bot.reply_to(message, f"✅ Admin command received: {text}")
+    # Confirm linkage to the admin
+    admin_bot.reply_to(message, f"✅ Admin Link Active! (Your ID: {admin_chat_id})\nCommand received: {text}")
 
-    # Inject the Admin's command silently into all active customer memories
-    for cid, history in user_memory.items():
-        history.append({
-            "role": "system", 
-            "content": f"[SYSTEM NOTIFICATION - ADMIN REPLIED]: {text}"
-        })
-        
-        # Proactively trigger the AI to tell the customer their payment was approved
-        try:
-            completion = client.chat.completions.create(
-                model="openai/gpt-oss-120b",
-                messages=history,
-                temperature=1,
-                max_completion_tokens=2048,
-                top_p=1
-            )
-            ai_reply = completion.choices[0].message.content
+    # Only inject into the AI memory if it looks like an approval or voucher command
+    if "YES" in text.upper() or "NO" in text.upper() or "VOUCHER" in text.upper():
+        for cid, history in user_memory.items():
+            history.append({
+                "role": "system", 
+                "content": f"[SYSTEM NOTIFICATION - ADMIN REPLIED]: {text}"
+            })
             
-            # Ensure no alerts leak back to the customer here
-            clean_reply = "\n".join([line for line in ai_reply.split('\n') if "[ADMIN_ALERT]" not in line]).strip()
-            
-            if clean_reply:
-                history.append({"role": "assistant", "content": ai_reply})
-                customer_bot.send_message(cid, clean_reply)
-        except Exception as e:
-            pass
+            # Automatically trigger the AI to tell the customer the good/bad news
+            try:
+                completion = client.chat.completions.create(
+                    model="openai/gpt-oss-120b",
+                    messages=history,
+                    temperature=1,
+                    max_completion_tokens=2048,
+                    top_p=1
+                )
+                ai_reply = completion.choices[0].message.content
+                clean_reply = re.sub(r'\[ADMIN_ALERT\].*', '', ai_reply, flags=re.IGNORECASE).strip()
+                
+                if clean_reply:
+                    history.append({"role": "assistant", "content": ai_reply})
+                    customer_bot.send_message(cid, clean_reply)
+            except Exception as e:
+                pass
 
 
 # ==========================================
@@ -140,7 +142,7 @@ app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "Dual-Bot Splash Internet System is Awake!"
+    return "Dual-Bot System Running!"
 
 def run_customer_bot():
     customer_bot.infinity_polling()
@@ -149,9 +151,7 @@ def run_admin_bot():
     admin_bot.infinity_polling()
 
 if __name__ == "__main__":
-    # Start both bots in separate threads so they run at the exact same time
     Thread(target=run_customer_bot).start()
     Thread(target=run_admin_bot).start()
-    
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
