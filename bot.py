@@ -23,6 +23,9 @@ _raw_keys = [
     os.environ.get("GROQ_API_KEY_2"),
     os.environ.get("GROQ_API_KEY_3"),
     os.environ.get("GROQ_API_KEY_4"),
+    os.environ.get("GROQ_API_KEY_5"),
+    os.environ.get("GROQ_API_KEY_6"),
+    os.environ.get("GROQ_API_KEY_7"),
     os.environ.get("GROQ_API_KEY"),
 ]
 GROQ_API_KEYS = [k for k in _raw_keys if k]
