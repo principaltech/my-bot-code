@@ -1,6 +1,8 @@
 import telebot
 import os
 import re
+import json
+import sqlite3
 from flask import Flask
 from threading import Thread, Lock
 from groq import Groq
@@ -11,6 +13,25 @@ ADMIN_BOT_TOKEN = os.environ.get("ADMIN_BOT_TOKEN")     # Bot 2: Admin Bot
 
 customer_bot = telebot.TeleBot(TELEGRAM_TOKEN)
 admin_bot = telebot.TeleBot(ADMIN_BOT_TOKEN)
+
+# ==========================================
+# ADMIN AUTHENTICATION
+# ==========================================
+# Comma-separated Telegram user IDs allowed to act as admin, e.g.
+# ADMIN_USER_IDS="123456789,987654321" in your environment.
+# Without this set, the admin bot refuses everyone (fail closed, not open) -
+# previously *anyone* who found the admin bot and said "hi" became the admin.
+_admin_ids_raw = os.environ.get("ADMIN_USER_IDS", "")
+ADMIN_USER_IDS = {
+    int(x.strip()) for x in _admin_ids_raw.split(",") if x.strip().isdigit()
+}
+if not ADMIN_USER_IDS:
+    print("[WARN] ADMIN_USER_IDS is not set - the admin bot will reject everyone until it is.")
+
+
+def is_authorized_admin(message):
+    u = message.from_user
+    return bool(u) and u.id in ADMIN_USER_IDS
 
 # ==========================================
 # GROQ MULTI-KEY ROTATION / FALLBACK
@@ -77,6 +98,115 @@ user_last_message_id = {}   # customer_key -> message_id (for reply_to)
 customer_chat_id = {}       # customer_key -> chat_id to send messages back to
 customer_display = {}       # customer_key -> human-readable label for admin alerts
 admin_chat_id = None
+
+# ==========================================
+# PERSISTENCE (Postgres on Neon, SQLite fallback for local dev)
+# ==========================================
+# Everything above lived only in RAM before, so a restart/redeploy wiped
+# in-progress payments and your whole voucher stock.
+#
+# On most free hosting tiers the container's local disk is wiped on every
+# redeploy, so a local SQLite file does NOT survive. Set DATABASE_URL to a
+# hosted Postgres connection string (e.g. from neon.tech) and state persists
+# properly. With no DATABASE_URL set, this falls back to local SQLite, which
+# is fine for running on your own machine.
+DATABASE_URL = os.environ.get("DATABASE_URL")
+_db_lock = Lock()
+
+if DATABASE_URL:
+    import psycopg
+
+    def _init_db():
+        with psycopg.connect(DATABASE_URL) as conn:
+            conn.execute("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)")
+            conn.commit()
+
+    def _write_state(payload):
+        with psycopg.connect(DATABASE_URL) as conn:
+            conn.execute(
+                "INSERT INTO kv (key, value) VALUES ('state', %s) "
+                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                (payload,),
+            )
+            conn.commit()
+
+    def _read_state():
+        with psycopg.connect(DATABASE_URL) as conn:
+            row = conn.execute("SELECT value FROM kv WHERE key = 'state'").fetchone()
+            return row[0] if row else None
+
+    print("[DB] Using Postgres (DATABASE_URL is set).")
+else:
+    DB_PATH = os.environ.get("BOT_DB_PATH", "splash_bot.db")
+    _sqlite = sqlite3.connect(DB_PATH, check_same_thread=False)
+
+    def _init_db():
+        _sqlite.execute("CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT)")
+        _sqlite.commit()
+
+    def _write_state(payload):
+        _sqlite.execute(
+            "INSERT INTO kv (key, value) VALUES ('state', ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (payload,),
+        )
+        _sqlite.commit()
+
+    def _read_state():
+        row = _sqlite.execute("SELECT value FROM kv WHERE key = 'state'").fetchone()
+        return row[0] if row else None
+
+    print(f"[DB] Using local SQLite at {DB_PATH} (no DATABASE_URL set). "
+          "This will NOT survive a redeploy on most hosts.")
+
+_init_db()
+
+
+def save_state():
+    """Snapshot all mutable bot state to the database. Cheap enough to call
+    after every handler; called explicitly (not on a timer) so state on disk
+    is never more than one message behind."""
+    global admin_chat_id
+    snapshot = {
+        "user_memory": user_memory,
+        "pending_approvals": pending_approvals,
+        "user_last_message_id": user_last_message_id,
+        "customer_chat_id": customer_chat_id,
+        "customer_display": customer_display,
+        "voucher_inventory": voucher_inventory,
+        "admin_chat_id": admin_chat_id,
+    }
+    try:
+        with _db_lock:
+            _write_state(json.dumps(snapshot))
+    except Exception as e:
+        print(f"[DB] Failed to save state: {e}")
+
+
+def load_state():
+    """Restore state saved by save_state(), if any. Called once at startup."""
+    global admin_chat_id
+    try:
+        with _db_lock:
+            raw = _read_state()
+        if not raw:
+            print("[DB] No saved state found - starting fresh.")
+            return
+        snapshot = json.loads(raw)
+        user_memory.update(snapshot.get("user_memory", {}))
+        pending_approvals.update(snapshot.get("pending_approvals", {}))
+        user_last_message_id.update(snapshot.get("user_last_message_id", {}))
+        customer_chat_id.update(snapshot.get("customer_chat_id", {}))
+        customer_display.update(snapshot.get("customer_display", {}))
+        for pkg, codes in snapshot.get("voucher_inventory", {}).items():
+            voucher_inventory[pkg] = codes
+        admin_chat_id = snapshot.get("admin_chat_id")
+        total_codes = sum(len(v) for v in voucher_inventory.values())
+        print(f"[DB] Restored state: {len(user_memory)} customer thread(s), "
+              f"{len(pending_approvals)} pending approval(s), "
+              f"{total_codes} voucher code(s), admin_chat_id={admin_chat_id}")
+    except Exception as e:
+        print(f"[DB] Failed to load state: {e}")
 
 
 def make_customer_key(message):
@@ -373,6 +503,8 @@ def handle_customer_message(message):
         if len(user_memory[customer_key]) > 15:
             user_memory[customer_key] = [user_memory[customer_key][0]] + user_memory[customer_key][-14:]
 
+        save_state()
+
     except Exception as e:
         customer_bot.reply_to(message, f"Error processing request: {str(e)}")
 
@@ -389,11 +521,18 @@ def handle_admin_message(message):
     if is_service_message(message.text):
         return
 
+    if not is_authorized_admin(message):
+        # Fail closed: unrecognized user gets no information about how the
+        # system works and cannot link, approve, reject, or touch inventory.
+        admin_bot.reply_to(message, "🚫 You are not authorized to use this bot.")
+        return
+
     admin_chat_id = message.chat.id
     text = message.text.strip()
 
     if text.lower() in ['/start', 'hello', 'hi', 'link']:
         admin_bot.reply_to(message, f"✅ Admin Link Active! (Your ID: {admin_chat_id})\nReady to receive and route vouchers.")
+        save_state()
         return
 
     if text.strip().lower() in ['stock', '/stock', 'inventory', '/inventory']:
@@ -438,6 +577,7 @@ def handle_admin_message(message):
                 "⚠️ Not found in stock (already used, wrong package, or typo):\n" + "\n".join(not_found)
             )
         admin_bot.reply_to(message, "\n\n".join(reply_parts))
+        save_state()
         return
 
     add_matches = [m for m in (ADD_CODE_PATTERN.match(line) for line in text.splitlines()) if m]
@@ -463,6 +603,7 @@ def handle_admin_message(message):
                 "\n\nKnown packages: " + ", ".join(PACKAGES.keys())
             )
         admin_bot.reply_to(message, "\n\n".join(reply_parts))
+        save_state()
         return
 
     target_key = find_target_customer(text)
@@ -491,6 +632,7 @@ def handle_admin_message(message):
     if target_chat_id is None:
         admin_bot.reply_to(message, f"⚠️ Lost track of chat for {target_label}; they'll need to message again.")
         pending_approvals.pop(target_key, None)
+        save_state()
         return
 
     def send_to_customer(msg_text):
@@ -518,6 +660,7 @@ def handle_admin_message(message):
 
             admin_bot.reply_to(message, f"✅ Delivered stored code '{code}' to {target_label} instantly.")
             pending_approvals.pop(target_key, None)
+            save_state()
             return
 
         elif decision in NO_WORDS:
@@ -528,6 +671,7 @@ def handle_admin_message(message):
                 f"↩️ Put that code back in stock. {target_label} is still waiting — "
                 "please reply with a different voucher code for them."
             )
+            save_state()
             return
 
         else:
@@ -553,6 +697,7 @@ def handle_admin_message(message):
 
         admin_bot.reply_to(message, f"❌ Rejection sent to {target_label}.")
         pending_approvals.pop(target_key, None)
+        save_state()
         return
 
     code = text.strip()
@@ -569,6 +714,7 @@ def handle_admin_message(message):
 
     admin_bot.reply_to(message, f"✅ Delivered code '{code}' to {target_label} instantly.")
     pending_approvals.pop(target_key, None)
+    save_state()
 
 
 # ==========================================
@@ -587,6 +733,7 @@ def run_admin_bot():
     admin_bot.infinity_polling()
 
 if __name__ == "__main__":
+    load_state()
     print(f"[Groq] Loaded {len(groq_clients)} API key(s) for rotation/fallback.")
     Thread(target=run_customer_bot).start()
     Thread(target=run_admin_bot).start()
