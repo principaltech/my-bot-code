@@ -174,6 +174,7 @@ def save_state():
         "customer_chat_id": customer_chat_id,
         "customer_display": customer_display,
         "voucher_inventory": voucher_inventory,
+        "used_payment_refs": sorted(used_payment_refs),
         "admin_chat_id": admin_chat_id,
     }
     try:
@@ -198,13 +199,15 @@ def load_state():
         user_last_message_id.update(snapshot.get("user_last_message_id", {}))
         customer_chat_id.update(snapshot.get("customer_chat_id", {}))
         customer_display.update(snapshot.get("customer_display", {}))
+        used_payment_refs.update(snapshot.get("used_payment_refs", []))
         for pkg, codes in snapshot.get("voucher_inventory", {}).items():
             voucher_inventory[pkg] = codes
         admin_chat_id = snapshot.get("admin_chat_id")
         total_codes = sum(len(v) for v in voucher_inventory.values())
         print(f"[DB] Restored state: {len(user_memory)} customer thread(s), "
               f"{len(pending_approvals)} pending approval(s), "
-              f"{total_codes} voucher code(s), admin_chat_id={admin_chat_id}")
+              f"{total_codes} voucher code(s), "
+              f"{len(used_payment_refs)} used payment reference(s), admin_chat_id={admin_chat_id}")
     except Exception as e:
         print(f"[DB] Failed to load state: {e}")
 
@@ -232,6 +235,11 @@ def display_name_for(message):
 #    "proposed_code": "..." or None, "package_key": "..." or None}
 pending_approvals = {}
 
+# Fingerprints (code_ending|price|phone) of payment proofs that have ALREADY
+# been redeemed for a voucher. Stops the same proof of payment being replayed
+# (or the AI re-raising an alert for it) to pull a second voucher out of stock.
+used_payment_refs = set()
+
 # Tracks admins who just typed a bare '/addcode' or '/deletecode' and are
 # expected to send the actual code (and package) in their *next* message,
 # instead of the full 'add code X for Y' / 'delete code X' syntax.
@@ -251,6 +259,11 @@ PACKAGES = {
 voucher_inventory = {pkg: [] for pkg in PACKAGES}
 _inventory_lock = Lock()
 
+CLOSING_WARNING = (
+    "Do not close this current chat, otherwise you might not receive your login code, "
+    "token, or password because the chat ID changes."
+)
+
 system_rules = """
 You are an automated customer care AI assistant for Splash Internet. You MUST follow these rules strictly:
 
@@ -268,19 +281,125 @@ You are an automated customer care AI assistant for Splash Internet. You MUST fo
    - Only ask a clarifying question about the package if the amount paid matches more than one package price (e.g. $1.00 = both 24 HOURS LITE and 7 DAYS) or matches no known price at all.
    - EXTRACTING THE TRANSACTION REFERENCE: proof-of-payment messages often contain a labelled reference such as "Approval Code: PP260917.1524.T3000820", "Transaction ID: ...", "Ref: ...", or "Confirmation code: ...". When such a label is present, CODE_ENDING MUST be the last 4 characters of that specific code (letters and digits only, ignore punctuation) - e.g. "T3000820" -> "0820". Do NOT substitute the phone number's last 4 digits when a transaction reference is present, even if it looks unfamiliar or contains letters. Only use the phone number's last 4 digits as a last resort when the customer's message contains no transaction/approval/reference code at all.
 4. AFTER PAYMENT PROOF IS SUBMITTED:
-   - Tell the user to wait 30 seconds while the payment is validated.
+   - Tell the user to wait 30 seconds while the payment is validated. That is ALL you say about the outcome - see rule 9.
 5. ADMIN PAYMENT APPROVAL (CRITICAL INSTRUCTION):
    - When a user submits proof of payment, you MUST generate the exact tag [ADMIN_ALERT] followed immediately by a structured line in EXACTLY this format (pipe-separated, one line, then your own short note after a dash):
      [ADMIN_ALERT] CODE_ENDING: <last 4 characters of the transaction/approval reference, or phone last 4 if truly no reference was given> | PRICE: $<amount> | PHONE: <customer phone number> | PACKAGE: <package name> - Admin, please provide a voucher code.
    - Fill in every field. If you used the phone number instead of a transaction reference, say so explicitly in your note.
    - The system automatically checks real voucher stock for you - you do not need to track or remember whether a code is available. Just always send an accurate alert; the backend and admin decide what happens next.
+   - Send the [ADMIN_ALERT] only ONCE per payment. If the customer sends a follow-up message about a payment you already alerted the admin about, do NOT send another [ADMIN_ALERT]; just tell them to keep waiting.
    - NEVER tell the user you forwarded the payment without including this exact [ADMIN_ALERT] structured line.
 6. ADMIN REPLIES:
    - You will never need to interpret or forward admin replies yourself - the backend now matches the admin's reply to the correct customer and delivers the voucher (or rejection) directly and automatically. You do not need to output [IGNORE_ADMIN] or handle raw codes.
 7. MANDATORY CLOSING WARNING:
    - You MUST include this exact warning at the end of EVERY customer response: "Do not close this current chat, otherwise you might not receive your login code, token, or password because the chat ID changes."
 8. SCOPE: Only answer about Splash Internet.
+9. NO CODES, NO APPROVALS (ABSOLUTE, OVERRIDES EVERYTHING ELSE):
+   - You do NOT have access to any voucher codes, login codes, tokens, usernames or passwords. You must NEVER write, invent, guess or repeat one, in any format.
+   - You must NEVER say or imply that a payment "has been approved", "verified", "confirmed" or "successful". You cannot know that. Only the backend can, and it sends its own separate approval message containing the real code.
+   - Any code that appears in a message from you would be FAKE and would cost the business money. If a customer asks where their code is, tell them to keep waiting for the approval message, and that the admin is checking their payment.
 """
+
+# Fixed customer-facing texts used when the AI's own reply has to be replaced.
+WAIT_MESSAGE = "Thank you, we have received your payment proof. Please wait about 30 seconds while we validate the payment."
+NEED_PROOF_MESSAGE = ("Please send your phone number, the package you want, and your proof of payment "
+                      "(the EcoCash confirmation message or the transaction reference).")
+DUPLICATE_MESSAGE = ("This payment proof has already been processed. If you did not receive your voucher, "
+                     "please scroll up in this chat to find it, or contact support.")
+
+
+# ==========================================
+# ANTI-HALLUCINATION GUARD
+# ==========================================
+# ROOT CAUSE of "fake codes": the customer-facing text comes straight from the
+# LLM. The LLM had (a) no rule forbidding it from writing approvals, and (b)
+# chat history containing real "Your payment has been approved / Voucher code:"
+# messages to imitate. So it wrote its own approval with an invented code while
+# the real stored code was still waiting for the admin. Prompting alone can
+# never fully prevent that, so we ALSO enforce it in code: nothing that looks
+# like an approval or a code is ever allowed to leave the AI. Real vouchers are
+# sent only by the admin-approval path below, using inventory / admin input.
+FAKE_APPROVAL_RE = re.compile(
+    r'(?:payment\s+(?:has\s+been|was|is|is\s+now)\s+(?:approved|verified|confirmed|successful))'
+    r'|(?:(?:voucher|login|access|wifi|wi-fi)\s*(?:code|pin)\s*\**\s*[:\-\u2013\u2014=]\s*\**\s*[A-Za-z0-9])'
+    r'|(?:\b(?:token|password|username|pin)\s*\**\s*[:=]\s*\**\s*[A-Za-z0-9])',
+    re.IGNORECASE
+)
+
+# Secondary net: a 6-14 char token mixing letters AND digits (typical voucher
+# shape, e.g. "q7m5z1r") that the customer never wrote themselves.
+SUSPICIOUS_TOKEN_RE = re.compile(
+    r'\b(?=[A-Za-z0-9]*[A-Za-z])(?=[A-Za-z0-9]*\d)[A-Za-z0-9]{6,14}\b'
+)
+
+
+def strip_fake_approval(reply, known_text=""):
+    """
+    Cut the AI's reply at the first line that looks like an approval message or
+    a voucher/login credential. `known_text` = everything the customer has
+    typed, so tokens they wrote themselves (their own transaction reference)
+    are not mistaken for invented codes.
+    Returns (safe_reply, was_tampered).
+    """
+    if not reply:
+        return "", False
+
+    known = (known_text or "").lower()
+    cut = None
+
+    m = FAKE_APPROVAL_RE.search(reply)
+    if m:
+        cut = m.start()
+
+    for tm in SUSPICIOUS_TOKEN_RE.finditer(reply):
+        if tm.group(0).lower() not in known:
+            cut = tm.start() if cut is None else min(cut, tm.start())
+            break
+
+    if cut is None:
+        return reply, False
+
+    line_start = reply.rfind('\n', 0, cut) + 1
+    return reply[:line_start].rstrip(), True
+
+
+def ensure_closing_warning(text):
+    if "do not close this current chat" in text.lower():
+        return text
+    return f"{text}\n\n{CLOSING_WARNING}"
+
+
+def payment_fingerprint(info):
+    """Stable identity of a payment proof: transaction ending + amount + phone.
+    Returns None if there isn't enough information to fingerprint safely."""
+    if not info:
+        return None
+    ending = re.sub(r'[^a-z0-9]', '', (info.get("code_ending") or "").lower())
+    phone = re.sub(r'\D', '', info.get("phone") or "")
+    price = re.sub(r'[^0-9.]', '', info.get("price") or "")
+    if not ending or not phone:
+        return None
+    return f"{ending}|{price}|{phone}"
+
+
+def mark_payment_used(info):
+    fp = payment_fingerprint(info)
+    if fp:
+        used_payment_refs.add(fp)
+
+
+def note_voucher_delivered(history, package):
+    """Tell the AI a voucher was delivered WITHOUT putting the approval template
+    (or the code itself) in its history, so it has nothing to imitate or leak."""
+    history.append({
+        "role": "system",
+        "content": (
+            f"SYSTEM NOTE: The backend has approved the customer's payment for {package} and delivered "
+            "their voucher in a separate message. Do NOT write voucher codes or approval messages "
+            "yourself. If asked for the code, tell them to scroll up to the approval message."
+        )
+    })
+
 
 def parse_admin_alert(alert_text):
     """
@@ -531,20 +650,35 @@ def handle_customer_message(message):
         completion = create_completion(
             user_memory[customer_key],
             model="openai/gpt-oss-120b",
-            temperature=1,
+            temperature=0.3,   # was 1: high temperature made the model far more likely to improvise
             max_completion_tokens=2048,
             top_p=1
         )
-        ai_reply = completion.choices[0].message.content
+        ai_reply = completion.choices[0].message.content or ""
 
         alerts = re.findall(r'\[ADMIN_ALERT\](.*)', ai_reply, re.IGNORECASE)
         clean_reply = re.sub(r'\[ADMIN_ALERT\].*', '', ai_reply, flags=re.IGNORECASE).strip()
+
+        # ---- HARD GUARD: the AI may never issue approvals or codes. ----
+        known_text = "\n".join(
+            m["content"] for m in user_memory[customer_key] if m["role"] == "user"
+        )
+        clean_reply, tampered = strip_fake_approval(clean_reply, known_text)
+        if tampered:
+            print(f"[GUARD] Blocked a fabricated approval/voucher in AI reply for {customer_key}. "
+                  f"Original: {ai_reply!r}")
+        if not clean_reply and (alerts or tampered):
+            clean_reply = WAIT_MESSAGE if alerts else NEED_PROOF_MESSAGE
+
+        duplicate_notice = False
 
         if alerts:
             if admin_chat_id:
                 for alert in alerts:
                     alert_text = alert.strip()
                     parsed = parse_admin_alert(alert_text)
+                    label = customer_display.get(customer_key, str(customer_key))
+
                     if parsed:
                         # Deterministic override: if the customer's own message
                         # contains a labelled transaction/approval reference,
@@ -553,13 +687,34 @@ def handle_customer_message(message):
                         if real_ending:
                             parsed["code_ending"] = real_ending
 
+                        fp = payment_fingerprint(parsed)
+
+                        # Already redeemed? Don't reserve/issue another voucher.
+                        if fp and fp in used_payment_refs:
+                            duplicate_notice = True
+                            admin_bot.send_message(
+                                admin_chat_id,
+                                f"⚠️ DUPLICATE payment proof from {label} "
+                                f"(code ending {parsed['code_ending']}, {parsed['price']}, phone {parsed['phone']}). "
+                                "A voucher was already issued for this proof, so no new request was created."
+                            )
+                            continue
+
+                        existing = pending_approvals.get(customer_key)
+                        if existing:
+                            # Same request being re-raised: keep the one we have.
+                            if fp and payment_fingerprint(existing) == fp:
+                                continue
+                            # Different request: give the old reservation back
+                            # to stock instead of silently losing that code.
+                            if existing.get("proposed_code"):
+                                return_voucher(existing.get("package_key"), existing["proposed_code"])
+
                         pending_approvals[customer_key] = parsed
                         pkg_key = normalize_package(parsed['package'])
                         reserved_code = reserve_voucher(pkg_key)
                         pending_approvals[customer_key]["package_key"] = pkg_key
                         pending_approvals[customer_key]["proposed_code"] = reserved_code
-
-                        label = customer_display.get(customer_key, str(customer_key))
 
                         if reserved_code:
                             admin_msg = (
@@ -583,7 +738,9 @@ def handle_customer_message(message):
                                 f"No stored code for this package. Reply with a new voucher code to approve, or 'no' to reject."
                             )
                     else:
-                        label = customer_display.get(customer_key, str(customer_key))
+                        if customer_key in pending_approvals:
+                            # Unparseable repeat alert while one is already open.
+                            continue
                         pending_approvals[customer_key] = {
                             "code_ending": extract_code_ending_from_text(text) or "",
                             "price": "", "phone": "", "package": "",
@@ -594,8 +751,19 @@ def handle_customer_message(message):
             else:
                 clean_reply += "\n\n⚠️ SYSTEM NOTIFICATION: The Admin Bot is currently unlinked. (Admin: Please send /start to the Admin bot to reconnect routing)."
 
+        if duplicate_notice:
+            clean_reply = DUPLICATE_MESSAGE
+
         if clean_reply:
-            user_memory[customer_key].append({"role": "assistant", "content": ai_reply})
+            clean_reply = ensure_closing_warning(clean_reply)
+
+            # Store the SANITIZED reply (plus the alert lines so the model
+            # remembers it already alerted). Never store the raw AI text: a
+            # fabricated approval in history teaches the model to repeat it.
+            history_entry = clean_reply
+            if alerts and not duplicate_notice:
+                history_entry += "".join(f"\n[ADMIN_ALERT]{a}" for a in alerts)
+            user_memory[customer_key].append({"role": "assistant", "content": history_entry})
             customer_bot.reply_to(message, clean_reply)
 
         if len(user_memory[customer_key]) > 15:
@@ -883,6 +1051,9 @@ def handle_admin_message(message):
     target_label = customer_display.get(target_key, target_key)
 
     if target_chat_id is None:
+        # Don't lose a reserved code just because we lost the chat.
+        if info.get("proposed_code"):
+            return_voucher(info.get("package_key"), info["proposed_code"])
         admin_bot.reply_to(message, f"⚠️ Lost track of chat for {target_label}; they'll need to message again.")
         pending_approvals.pop(target_key, None)
         save_state()
@@ -904,13 +1075,13 @@ def handle_admin_message(message):
                 f"✅ Your payment has been approved!\n\n"
                 f"Package: {package}\n"
                 f"Voucher code: {code}\n\n"
-                "Do not close this current chat, otherwise you might not receive your login code, "
-                "token, or password because the chat ID changes."
+                + CLOSING_WARNING
             )
             history = user_memory.setdefault(target_key, [{"role": "system", "content": system_rules}])
-            history.append({"role": "assistant", "content": voucher_message})
+            note_voucher_delivered(history, package)
             send_to_customer(voucher_message)
 
+            mark_payment_used(info)
             admin_bot.reply_to(message, f"✅ Delivered stored code '{code}' to {target_label} instantly.")
             pending_approvals.pop(target_key, None)
             save_state()
@@ -942,8 +1113,7 @@ def handle_admin_message(message):
         rejection_message = (
             "❌ Unfortunately we could not verify your payment. "
             "Please double-check your proof of payment and try again, or contact support.\n\n"
-            "Do not close this current chat, otherwise you might not receive your login code, "
-            "token, or password because the chat ID changes."
+            + CLOSING_WARNING
         )
         history.append({"role": "assistant", "content": rejection_message})
         send_to_customer(rejection_message)
@@ -954,17 +1124,29 @@ def handle_admin_message(message):
         return
 
     code = text.strip()
+
+    # A real voucher code is a single token. Refuse anything with spaces so a
+    # stray sentence ("ok thanks", "wait a sec") is never sent to a customer
+    # as their code.
+    if len(code.split()) != 1:
+        admin_bot.reply_to(
+            message,
+            f"⚠️ That doesn't look like a single voucher code, so I did NOT send it to {target_label}. "
+            "Send only the code (no spaces), or 'no' to reject."
+        )
+        return
+
     package = info.get("package") or "your package"
     voucher_message = (
         f"✅ Your payment has been approved!\n\n"
         f"Package: {package}\n"
         f"Voucher code: {code}\n\n"
-        "Do not close this current chat, otherwise you might not receive your login code, "
-        "token, or password because the chat ID changes."
+        + CLOSING_WARNING
     )
-    history.append({"role": "assistant", "content": voucher_message})
+    note_voucher_delivered(history, package)
     send_to_customer(voucher_message)
 
+    mark_payment_used(info)
     admin_bot.reply_to(message, f"✅ Delivered code '{code}' to {target_label} instantly.")
     pending_approvals.pop(target_key, None)
     save_state()
