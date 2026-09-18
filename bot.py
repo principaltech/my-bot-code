@@ -232,6 +232,13 @@ def display_name_for(message):
 #    "proposed_code": "..." or None, "package_key": "..." or None}
 pending_approvals = {}
 
+# Tracks admins who just typed a bare '/addcode' or '/deletecode' and are
+# expected to send the actual code (and package) in their *next* message,
+# instead of the full 'add code X for Y' / 'delete code X' syntax.
+# Keyed by admin chat_id -> 'add_code' | 'delete_code'.
+admin_awaiting = {}
+_admin_state_lock = Lock()
+
 # Package reference (price + data), mirrors the pricing table below.
 PACKAGES = {
     "24 HOURS LITE": {"price": "$1.00", "data": "UNLIMITED"},
@@ -411,6 +418,20 @@ DELETE_CODE_PATTERN = re.compile(
     re.IGNORECASE
 )
 
+# Short forms used by the guided /addcode and /deletecode flow below: same
+# idea as ADD_CODE_PATTERN / DELETE_CODE_PATTERN but without the leading
+# "add code" / "delete code" words, since the admin already told us their
+# intent via the slash command and this is just their follow-up reply.
+ADD_CODE_SHORT_PATTERN = re.compile(
+    r'^\s*(?P<code>\S+)\s+for\s+(?P<package>.+?)\s*$',
+    re.IGNORECASE
+)
+
+DELETE_CODE_SHORT_PATTERN = re.compile(
+    r'^\s*(?P<code>\S+)(?:\s+from\s+(?P<package>.+?))?\s*$',
+    re.IGNORECASE
+)
+
 # Bulk-add format: one or more two-line blocks of
 #   CODE: <code>
 #   <price>:<data>:<package>      e.g. "50C:5GB:2DAYS"
@@ -454,6 +475,31 @@ def is_service_message(text):
     return bool(SERVICE_MESSAGE_PATTERNS.search(text or ""))
 
 
+def cancel_pending_for_customer(customer_key, reason="left the chat"):
+    """
+    Cancel any pending voucher approval for this customer (e.g. because they
+    left the chat before an admin could approve their payment), returning
+    any reserved voucher code to stock and letting the admin know.
+    """
+    info = pending_approvals.pop(customer_key, None)
+    if not info:
+        return False
+
+    if info.get("proposed_code"):
+        return_voucher(info.get("package_key"), info["proposed_code"])
+
+    label = customer_display.get(customer_key, customer_key)
+    if admin_chat_id:
+        admin_bot.send_message(
+            admin_chat_id,
+            f"⚠️ {label} {reason} before their payment was approved. "
+            "Their pending approval request has been canceled"
+            + (" and the reserved voucher code was returned to stock." if info.get("proposed_code") else ".")
+        )
+    save_state()
+    return True
+
+
 # ==========================================
 # BOT 1: CUSTOMER BOT HANDLER
 # ==========================================
@@ -462,6 +508,10 @@ def handle_customer_message(message):
     if message.content_type != 'text' or not (message.text or "").strip():
         return
     if is_service_message(message.text):
+        # Someone left/was removed/etc. If they had a payment awaiting
+        # approval, don't leave the admin holding a request for a customer
+        # who's no longer there to receive the voucher.
+        cancel_pending_for_customer(make_customer_key(message))
         return
 
     customer_key = make_customer_key(message)
@@ -557,6 +607,18 @@ def handle_customer_message(message):
         customer_bot.reply_to(message, f"Error processing request: {str(e)}")
 
 
+# Native Telegram service event for a member leaving/being removed from a
+# group. This is more reliable than text-pattern matching since Telegram
+# tells us exactly who left via message.left_chat_member.
+@customer_bot.message_handler(content_types=['left_chat_member'])
+def handle_customer_left(message):
+    left_user = message.left_chat_member
+    if not left_user:
+        return
+    customer_key = f"{message.chat.id}:{left_user.id}"
+    cancel_pending_for_customer(customer_key)
+
+
 # ==========================================
 # BOT 2: ADMIN BOT HANDLER
 # ==========================================
@@ -583,6 +645,81 @@ def handle_admin_message(message):
         save_state()
         return
 
+    # ------------------------------------------------------------------
+    # Guided add/delete-code flow: after the admin sends the bare
+    # '/addcode' or '/deletecode' command, we remember that and treat
+    # their *next* message as the code (and optional package) instead of
+    # requiring the full 'add code X for Y' / 'delete code X' syntax.
+    # ------------------------------------------------------------------
+    if text.lower() in ['/addcode', 'addcode']:
+        with _admin_state_lock:
+            admin_awaiting[admin_chat_id] = 'add_code'
+        admin_bot.reply_to(
+            message,
+            "✏️ Send the code to add, in this format:\n<code> for <package>\n\nExample: A1B2C3 for 7 DAYS"
+        )
+        return
+
+    if text.lower() in ['/deletecode', 'deletecode']:
+        with _admin_state_lock:
+            admin_awaiting[admin_chat_id] = 'delete_code'
+        admin_bot.reply_to(
+            message,
+            "✏️ Send the code to delete. Optionally add the package too:\n<code>\nor: <code> from <package>"
+        )
+        return
+
+    awaiting = None
+    with _admin_state_lock:
+        # Only consume the awaiting state for a plain follow-up reply - if
+        # the admin instead types another slash command, let it fall
+        # through to normal command handling below and drop the pending
+        # guided flow rather than misinterpreting the command as a code.
+        if admin_chat_id in admin_awaiting and not text.startswith('/'):
+            awaiting = admin_awaiting.pop(admin_chat_id)
+
+    if awaiting == 'add_code':
+        m = ADD_CODE_SHORT_PATTERN.match(text)
+        if not m:
+            admin_bot.reply_to(
+                message,
+                "⚠️ Didn't recognize that format. Please send it as:\n<code> for <package>"
+            )
+            return
+        code = m.group("code").strip()
+        pkg_input = m.group("package").strip()
+        pkg_key = normalize_package(pkg_input)
+        if pkg_key:
+            with _inventory_lock:
+                voucher_inventory.setdefault(pkg_key, []).append(code)
+            admin_bot.reply_to(
+                message,
+                f"✅ Added to stock:\n{code} → {pkg_key} ({PACKAGES[pkg_key]['price']}, {PACKAGES[pkg_key]['data']})"
+            )
+            save_state()
+        else:
+            admin_bot.reply_to(
+                message,
+                f"⚠️ Could not match package '{pkg_input}'.\n\nKnown packages: " + ", ".join(PACKAGES.keys())
+            )
+        return
+
+    if awaiting == 'delete_code':
+        m = DELETE_CODE_SHORT_PATTERN.match(text)
+        if not m:
+            admin_bot.reply_to(message, "⚠️ Didn't recognize that. Please send just the code, e.g.: A1B2C3")
+            return
+        code = m.group("code").strip()
+        pkg_input = m.group("package")
+        pkg_key = normalize_package(pkg_input.strip()) if pkg_input else None
+        found_pkg = delete_voucher(code, pkg_key)
+        if found_pkg:
+            admin_bot.reply_to(message, f"🗑️ Removed from stock:\n{code} (was in {found_pkg})")
+            save_state()
+        else:
+            admin_bot.reply_to(message, f"⚠️ Not found in stock (already used, wrong package, or typo): {code}")
+        return
+
     if text.strip().lower() in ['stock', '/stock', 'inventory', '/inventory']:
         lines = [
             f"- {pkg} ({info['price']}, {info['data']}): {len(voucher_inventory.get(pkg, []))} code(s)"
@@ -595,7 +732,10 @@ def handle_admin_message(message):
         )
         return
 
-    if text.strip().lower() in ['stock full', 'stock detail', 'list codes', '/codes']:
+    if text.strip().lower() in [
+        'stock full', 'stock detail', 'list codes', '/codes',
+        '/stockfull', '/orstockdetail', '/listcodes'
+    ]:
         lines = []
         for pkg, info in PACKAGES.items():
             codes = voucher_inventory.get(pkg, [])
