@@ -248,6 +248,8 @@ You are an automated customer care AI assistant for Splash Internet. You MUST fo
 9. NO CODES, NO APPROVALS (ABSOLUTE, OVERRIDES EVERYTHING ELSE):
    - You do NOT have access to any voucher codes, login codes, tokens, usernames or passwords. You must NEVER write, invent, guess or repeat one, in any format.
    - You must NEVER say or imply that a payment "has been approved", "verified", "confirmed" or "successful". You cannot know that.
+10. FRESH TRANSACTIONS:
+   - If you see a SYSTEM NOTE telling you a new payment reference was submitted, treat it as a completely separate, brand-new transaction. Do NOT reuse a phone number or package mentioned earlier in this chat for that new reference. Ask the customer to (re)confirm both before producing any [ADMIN_ALERT].
 """
 
 WAIT_MESSAGE = "Thank you, we have received your payment proof. Please wait about 30 seconds while we validate the payment."
@@ -491,11 +493,16 @@ def handle_customer_message(message):
     extracted_phone = extract_phone_from_text(text)
     extracted_pkg = normalize_package(text)
 
+    # Make sure conversation memory exists before we possibly inject a system note below.
+    if customer_key not in user_memory:
+        user_memory[customer_key] = [{"role": "system", "content": system_rules}]
+
     if extracted_ref:
         customer_last_code[customer_key] = extracted_ref
         current_pending = pending_approvals.get(customer_key)
         # If approval code changed or is new, force reset phone/package slots
         if not current_pending or current_pending.get("code_ending") != extracted_ref:
+            is_repeat_customer = current_pending is not None
             pending_approvals[customer_key] = {
                 "code_ending": extracted_ref,
                 "price": "$1.00",
@@ -503,25 +510,44 @@ def handle_customer_message(message):
                 "package": extracted_pkg,     # Will be None if not in same msg, forcing prompt
                 "package_key": extracted_pkg,
                 "proposed_code": None,
-                "alert_sent": False
+                "alert_sent": False,
+                # These flags track whether phone/package were confirmed by OUR extraction
+                # (not by the AI's memory of a previous, unrelated transaction).
+                "phone_confirmed": bool(extracted_phone),
+                "package_confirmed": bool(extracted_pkg),
             }
+            if is_repeat_customer:
+                # Tell the model explicitly not to reuse stale slot values from earlier
+                # in the chat history for this brand-new payment reference.
+                user_memory[customer_key].append({
+                    "role": "system",
+                    "content": (
+                        "SYSTEM NOTE: The customer just submitted a NEW payment reference, different "
+                        "from any earlier one in this chat. Treat this as a brand-new, separate "
+                        "transaction. Do NOT reuse the phone number or package the customer mentioned "
+                        "earlier in this conversation for this new reference, even though it is visible "
+                        "above in the chat history. You must ask them to (re)confirm both the phone "
+                        "number and the package for THIS payment before producing any [ADMIN_ALERT]."
+                    )
+                })
         else:
             if extracted_phone:
                 current_pending["phone"] = extracted_phone
+                current_pending["phone_confirmed"] = True
             if extracted_pkg:
                 current_pending["package"] = extracted_pkg
                 current_pending["package_key"] = extracted_pkg
+                current_pending["package_confirmed"] = True
     else:
         # Update existing slot state with phone or package if sent separately
         if customer_key in pending_approvals:
             if extracted_phone:
                 pending_approvals[customer_key]["phone"] = extracted_phone
+                pending_approvals[customer_key]["phone_confirmed"] = True
             if extracted_pkg:
                 pending_approvals[customer_key]["package"] = extracted_pkg
                 pending_approvals[customer_key]["package_key"] = extracted_pkg
-
-    if customer_key not in user_memory:
-        user_memory[customer_key] = [{"role": "system", "content": system_rules}]
+                pending_approvals[customer_key]["package_confirmed"] = True
 
     user_memory[customer_key].append({"role": "user", "content": text})
     customer_bot.send_chat_action(message.chat.id, 'typing')
@@ -555,14 +581,18 @@ def handle_customer_message(message):
                 parsed = parse_admin_alert(alert_text, text)
                 
                 if parsed:
-                    # Sync with Python slot tracker
+                    # Sync with Python slot tracker.
+                    # IMPORTANT: only ever accept a phone/package value that OUR deterministic
+                    # extraction confirmed this turn (phone_confirmed / package_confirmed).
+                    # The AI's own phone/package in `parsed` may just be it recalling an OLD
+                    # transaction from chat history, which must never leak into a NEW one.
                     c_key = customer_key
                     if c_key in pending_approvals:
-                        if parsed.get("phone") and not pending_approvals[c_key].get("phone"):
-                            pending_approvals[c_key]["phone"] = parsed["phone"]
-                        if parsed.get("package") and not pending_approvals[c_key].get("package"):
-                            pending_approvals[c_key]["package"] = parsed["package"]
-                            pending_approvals[c_key]["package_key"] = normalize_package(parsed["package"])
+                        if not pending_approvals[c_key].get("phone_confirmed"):
+                            pending_approvals[c_key]["phone"] = None
+                        if not pending_approvals[c_key].get("package_confirmed"):
+                            pending_approvals[c_key]["package"] = None
+                            pending_approvals[c_key]["package_key"] = None
                     
                     # STRICT SLOT COMPLETENESS CHECK: Do not alert admin unless code, phone, and package are all present!
                     current_slot = pending_approvals.get(c_key, parsed)
@@ -575,6 +605,10 @@ def handle_customer_message(message):
                         clean_reply = f"I see your payment code ending **{parsed['code_ending']}**. To proceed, please also provide your **{' and '.join(missing)}**."
                         alerts_to_process = [] # Suppress admin alert until slots are filled
                     else:
+                        # Use the Python-confirmed values (not the AI's parsed copy) for the
+                        # actual alert sent to admin, since those are the ones we trust.
+                        parsed["phone"] = current_slot.get("phone")
+                        parsed["package"] = current_slot.get("package")
                         alerts_to_process.append((alert_text, parsed))
                         if parsed.get("code_ending"):
                             customer_last_code[customer_key] = parsed["code_ending"]
@@ -641,6 +675,8 @@ def handle_customer_message(message):
                         pending_approvals[customer_key]["package_key"] = pkg_key
                         pending_approvals[customer_key]["proposed_code"] = reserved_code
                         pending_approvals[customer_key]["alert_sent"] = True
+                        pending_approvals[customer_key]["phone_confirmed"] = True
+                        pending_approvals[customer_key]["package_confirmed"] = True
 
                         if reserved_code:
                             admin_msg = (
