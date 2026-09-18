@@ -1,33 +1,26 @@
-#!/bin/bash
+FROM python:3.11-bookworm
 
-set -e
+ENV DEBIAN_FRONTEND=noninteractive
 
-echo "======================================"
-echo " SPLASH INTERNET BOT"
-echo " Starting ZeroTier..."
-echo "======================================"
+RUN apt-get update && \
+    apt-get install -y \
+        curl \
+        iproute2 \
+        iptables \
+        ca-certificates \
+        procps && \
+    curl -s https://install.zerotier.com | bash && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
-mkdir -p /var/lib/zerotier-one
+WORKDIR /app
 
-zerotier-one -d
+COPY requirements.txt .
 
-echo "Waiting for ZeroTier..."
-sleep 8
+RUN pip install --no-cache-dir -r requirements.txt
 
-echo "Joining ZeroTier network..."
+COPY . .
 
-zerotier-cli join "$ZEROTIER_NETWORK_ID"
+RUN chmod +x start.sh
 
-sleep 5
-
-echo "ZeroTier status:"
-zerotier-cli status
-
-echo "ZeroTier networks:"
-zerotier-cli listnetworks
-
-echo "======================================"
-echo " Starting Splash Internet bot..."
-echo "======================================"
-
-python bot.py
+CMD ["./start.sh"]
