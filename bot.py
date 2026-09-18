@@ -354,7 +354,7 @@ def extract_code_ending_from_text(text):
         return raw[-7:]
     return None
 
-def parse_admin_alert(alert_text, user_text=""):
+def parse_admin_alert(alert_text, user_text="", authoritative_code=None):
     pattern = re.compile(
         r'CODE_ENDING:\s*(?P<code>[^|]+)\|\s*PRICE:\s*(?P<price>[^|]+)\|\s*PHONE:\s*(?P<phone>[^|]+)\|\s*PACKAGE:\s*(?P<package>[^\n]+)',
         re.IGNORECASE
@@ -367,8 +367,16 @@ def parse_admin_alert(alert_text, user_text=""):
     code_alphanum = re.sub(r'[^A-Za-z0-9]', '', code_ending)
     
     real_ending = extract_code_ending_from_text(user_text)
-    
-    if real_ending:
+
+    # Preference order for the code ending:
+    # 1. The code we ALREADY confirmed for this customer's open transaction (most trustworthy -
+    #    this came from a genuine proof-of-payment message earlier, not from the AI's memory).
+    # 2. A reference freshly extracted from the customer's own message this turn.
+    # 3. Whatever the AI itself wrote (least trustworthy - it can garble or truncate this).
+    clean_authoritative = re.sub(r'[^A-Za-z0-9]', '', (authoritative_code or ''))
+    if len(clean_authoritative) >= 7:
+        final_code = clean_authoritative[-7:]
+    elif real_ending:
         final_code = real_ending
     elif len(code_alphanum) >= 7:
         final_code = code_alphanum[-7:]
@@ -381,6 +389,36 @@ def parse_admin_alert(alert_text, user_text=""):
         "phone": m.group("phone").strip(" -\u2014:"),
         "package": re.split(r'[\u2014-]', m.group("package"))[0].strip(),
     }
+
+def finalize_alert_slots(parsed, customer_key):
+    """Cross-checks a parsed [ADMIN_ALERT] payload against the deterministic slot tracker
+    (pending_approvals), which is the only source we trust for phone/package. Returns
+    ('ready', parsed) once code+phone+package are all confirmed and admin can be alerted, or
+    ('missing', message) if the customer still needs to supply phone and/or package."""
+    if customer_key in pending_approvals:
+        if not pending_approvals[customer_key].get("phone_confirmed"):
+            pending_approvals[customer_key]["phone"] = None
+        if not pending_approvals[customer_key].get("package_confirmed"):
+            pending_approvals[customer_key]["package"] = None
+            pending_approvals[customer_key]["package_key"] = None
+
+    current_slot = pending_approvals.get(customer_key, parsed)
+    if not current_slot.get("phone") or not current_slot.get("package"):
+        missing = []
+        if not current_slot.get("phone"):
+            missing.append("phone number")
+        if not current_slot.get("package"):
+            missing.append("package")
+        msg = (
+            f"I see your payment code ending **{parsed['code_ending']}**. "
+            f"To proceed, please also provide your **{' and '.join(missing)}**."
+        )
+        return "missing", msg
+
+    parsed["phone"] = current_slot.get("phone")
+    parsed["package"] = current_slot.get("package")
+    customer_last_code[customer_key] = parsed["code_ending"]
+    return "ready", parsed
 
 def find_target_customer(admin_text):
     digits_in_text = re.findall(r'[A-Za-z0-9]{7,}', admin_text)
@@ -630,40 +668,39 @@ def handle_customer_message(message):
         if alerts:
             for alert_text in alerts:
                 alert_text = alert_text.strip()
-                parsed = parse_admin_alert(alert_text, text)
-                
+                authoritative_code = (
+                    (pending_approvals.get(customer_key) or {}).get("code_ending")
+                    or customer_last_code.get(customer_key)
+                )
+                clean_authoritative = re.sub(r'[^A-Za-z0-9]', '', authoritative_code or '')
+                parsed = parse_admin_alert(alert_text, text, authoritative_code=authoritative_code)
+
+                if not parsed and len(clean_authoritative) >= 7:
+                    # The AI's [ADMIN_ALERT] didn't match our strict pipe-delimited format at
+                    # all (missing/garbled fields), but we ALREADY have a verified code for this
+                    # customer's open transaction. Salvage rather than reject as "too short" -
+                    # pull whatever PRICE/PHONE/PACKAGE we can from the alert text, falling back
+                    # to what we've already tracked ourselves.
+                    active = pending_approvals.get(customer_key, {})
+
+                    def _salvage_field(field_name, default=None):
+                        fm = re.search(rf'{field_name}:\s*([^|\n]+)', alert_text, re.IGNORECASE)
+                        return fm.group(1).strip(" -\u2014:") if fm else default
+
+                    parsed = {
+                        "code_ending": clean_authoritative[-7:],
+                        "price": _salvage_field("PRICE", active.get("price") or "$1.00"),
+                        "phone": _salvage_field("PHONE", active.get("phone")),
+                        "package": _salvage_field("PACKAGE", active.get("package")),
+                    }
+
                 if parsed:
-                    # Sync with Python slot tracker.
-                    # IMPORTANT: only ever accept a phone/package value that OUR deterministic
-                    # extraction confirmed this turn (phone_confirmed / package_confirmed).
-                    # The AI's own phone/package in `parsed` may just be it recalling an OLD
-                    # transaction from chat history, which must never leak into a NEW one.
-                    c_key = customer_key
-                    if c_key in pending_approvals:
-                        if not pending_approvals[c_key].get("phone_confirmed"):
-                            pending_approvals[c_key]["phone"] = None
-                        if not pending_approvals[c_key].get("package_confirmed"):
-                            pending_approvals[c_key]["package"] = None
-                            pending_approvals[c_key]["package_key"] = None
-                    
-                    # STRICT SLOT COMPLETENESS CHECK: Do not alert admin unless code, phone, and package are all present!
-                    current_slot = pending_approvals.get(c_key, parsed)
-                    if not current_slot.get("phone") or not current_slot.get("package"):
-                        missing = []
-                        if not current_slot.get("phone"):
-                            missing.append("phone number")
-                        if not current_slot.get("package"):
-                            missing.append("package")
-                        clean_reply = f"I see your payment code ending **{parsed['code_ending']}**. To proceed, please also provide your **{' and '.join(missing)}**."
-                        alerts_to_process = [] # Suppress admin alert until slots are filled
+                    status, result = finalize_alert_slots(parsed, customer_key)
+                    if status == "missing":
+                        clean_reply = result
+                        alerts_to_process = []  # Suppress admin alert until slots are filled
                     else:
-                        # Use the Python-confirmed values (not the AI's parsed copy) for the
-                        # actual alert sent to admin, since those are the ones we trust.
-                        parsed["phone"] = current_slot.get("phone")
-                        parsed["package"] = current_slot.get("package")
-                        alerts_to_process.append((alert_text, parsed))
-                        if parsed.get("code_ending"):
-                            customer_last_code[customer_key] = parsed["code_ending"]
+                        alerts_to_process.append((alert_text, result))
                 else:
                     m = re.search(r'CODE_ENDING:\s*([^|]+)', alert_text, re.IGNORECASE)
                     if m:
