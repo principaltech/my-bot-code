@@ -83,7 +83,7 @@ user_memory = {}
 user_last_message_id = {}   
 customer_chat_id = {}       
 customer_display = {}       
-customer_last_code = {}     # Advanced tracking for exact Python-verified code endings
+customer_last_code = {}     
 admin_chat_id = None
 
 # ==========================================
@@ -255,6 +255,14 @@ NEED_PROOF_MESSAGE = ("Please send your phone number, the package you want, and 
                       "(the EcoCash confirmation message or the exact transaction reference).")
 DUPLICATE_MESSAGE = ("This payment proof has already been processed. If you did not receive your voucher, "
                      "please scroll up in this chat to find it, or contact support.")
+
+PHONE_PATTERN = re.compile(r'\b(07\d{8}|\+?2637\d{8})\b')
+
+def extract_phone_from_text(text):
+    if not text:
+        return None
+    m = PHONE_PATTERN.search(text)
+    return m.group(1) if m else None
 
 FAKE_APPROVAL_RE = re.compile(
     r'(?:payment\s+(?:has\s+been|was|is|is\s+now)\s+(?:approved|verified|confirmed|successful))'
@@ -478,10 +486,39 @@ def handle_customer_message(message):
     customer_chat_id[customer_key] = message.chat.id
     customer_display[customer_key] = display_name_for(message)
 
-    # 1. Deterministic Python Pre-Extraction (Source of Truth)
+    # 1. Deterministic Python Pre-Extraction & Slot Management
     extracted_ref = extract_code_ending_from_text(text)
+    extracted_phone = extract_phone_from_text(text)
+    extracted_pkg = normalize_package(text)
+
     if extracted_ref:
         customer_last_code[customer_key] = extracted_ref
+        current_pending = pending_approvals.get(customer_key)
+        # If approval code changed or is new, force reset phone/package slots
+        if not current_pending or current_pending.get("code_ending") != extracted_ref:
+            pending_approvals[customer_key] = {
+                "code_ending": extracted_ref,
+                "price": "$1.00",
+                "phone": extracted_phone,     # Will be None if not in same msg, forcing prompt
+                "package": extracted_pkg,     # Will be None if not in same msg, forcing prompt
+                "package_key": extracted_pkg,
+                "proposed_code": None,
+                "alert_sent": False
+            }
+        else:
+            if extracted_phone:
+                current_pending["phone"] = extracted_phone
+            if extracted_pkg:
+                current_pending["package"] = extracted_pkg
+                current_pending["package_key"] = extracted_pkg
+    else:
+        # Update existing slot state with phone or package if sent separately
+        if customer_key in pending_approvals:
+            if extracted_phone:
+                pending_approvals[customer_key]["phone"] = extracted_phone
+            if extracted_pkg:
+                pending_approvals[customer_key]["package"] = extracted_pkg
+                pending_approvals[customer_key]["package_key"] = extracted_pkg
 
     if customer_key not in user_memory:
         user_memory[customer_key] = [{"role": "system", "content": system_rules}]
@@ -518,9 +555,29 @@ def handle_customer_message(message):
                 parsed = parse_admin_alert(alert_text, text)
                 
                 if parsed:
-                    alerts_to_process.append((alert_text, parsed))
-                    if parsed.get("code_ending"):
-                        customer_last_code[customer_key] = parsed["code_ending"]
+                    # Sync with Python slot tracker
+                    c_key = customer_key
+                    if c_key in pending_approvals:
+                        if parsed.get("phone") and not pending_approvals[c_key].get("phone"):
+                            pending_approvals[c_key]["phone"] = parsed["phone"]
+                        if parsed.get("package") and not pending_approvals[c_key].get("package"):
+                            pending_approvals[c_key]["package"] = parsed["package"]
+                            pending_approvals[c_key]["package_key"] = normalize_package(parsed["package"])
+                    
+                    # STRICT SLOT COMPLETENESS CHECK: Do not alert admin unless code, phone, and package are all present!
+                    current_slot = pending_approvals.get(c_key, parsed)
+                    if not current_slot.get("phone") or not current_slot.get("package"):
+                        missing = []
+                        if not current_slot.get("phone"):
+                            missing.append("phone number")
+                        if not current_slot.get("package"):
+                            missing.append("package")
+                        clean_reply = f"I see your payment code ending **{parsed['code_ending']}**. To proceed, please also provide your **{' and '.join(missing)}**."
+                        alerts_to_process = [] # Suppress admin alert until slots are filled
+                    else:
+                        alerts_to_process.append((alert_text, parsed))
+                        if parsed.get("code_ending"):
+                            customer_last_code[customer_key] = parsed["code_ending"]
                 else:
                     m = re.search(r'CODE_ENDING:\s*([^|]+)', alert_text, re.IGNORECASE)
                     if m:
@@ -541,10 +598,9 @@ def handle_customer_message(message):
         elif not clean_reply and (alerts_to_process or tampered):
             clean_reply = WAIT_MESSAGE if alerts_to_process else NEED_PROOF_MESSAGE
 
-        # Python Templating Enforcement: If the AI mentions an approval code ending, strictly enforce Python's exact verified value
+        # Python Templating Enforcement: If AI mentions approval code ending, strictly enforce Python's exact verified value
         if customer_key in customer_last_code and ("code ending" in clean_reply.lower() or "approval code" in clean_reply.lower()):
             true_ending = customer_last_code[customer_key]
-            # Replace any hallucinated code ending sequence with the true Python-extracted string
             clean_reply = re.sub(
                 r'(Approval Code ending\s*\**\s*)[A-Za-z0-9]+(\s*\**)',
                 rf'\1**{true_ending}**\2',
@@ -572,18 +628,19 @@ def handle_customer_message(message):
                             )
                             continue
 
-                        existing = pending_approvals.get(customer_key)
-                        if existing:
-                            if fp and payment_fingerprint(existing) == fp:
-                                continue
-                            if existing.get("proposed_code"):
-                                return_voucher(existing.get("package_key"), existing["proposed_code"])
+                        existing = pending_approvals.get(customer_key, {})
+                        if existing.get("alert_sent"):
+                            continue # Already alerted
+
+                        if existing.get("proposed_code"):
+                            return_voucher(existing.get("package_key"), existing["proposed_code"])
 
                         pending_approvals[customer_key] = parsed
                         pkg_key = normalize_package(parsed['package'])
                         reserved_code = reserve_voucher(pkg_key)
                         pending_approvals[customer_key]["package_key"] = pkg_key
                         pending_approvals[customer_key]["proposed_code"] = reserved_code
+                        pending_approvals[customer_key]["alert_sent"] = True
 
                         if reserved_code:
                             admin_msg = (
@@ -607,12 +664,12 @@ def handle_customer_message(message):
                                 f"No stored code for this package. Reply with a new voucher code to approve, or 'no' to reject."
                             )
                     else:
-                        if customer_key in pending_approvals:
+                        if customer_key in pending_approvals and pending_approvals[customer_key].get("alert_sent"):
                             continue
                         pending_approvals[customer_key] = {
                             "code_ending": extract_code_ending_from_text(text) or "",
                             "price": "", "phone": "", "package": "",
-                            "package_key": None, "proposed_code": None
+                            "package_key": None, "proposed_code": None, "alert_sent": True
                         }
                         admin_msg = f"🔔 ADMIN ALERT (Customer: {label}):\n{alert_text}"
                     admin_bot.send_message(admin_chat_id, admin_msg)
