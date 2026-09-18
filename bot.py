@@ -349,6 +349,29 @@ def normalize_package(text):
     return candidates[0] if len(candidates) == 1 else None
 
 
+# Map a package name with ALL whitespace stripped -> canonical PACKAGES key,
+# e.g. "2DAYS" -> "2 DAYS", "14DAYSPRO" -> "14 DAYS PRO". This lets us match
+# compact package tags typed with no spaces at all (see normalize_package_compact
+# below), which normalize_package() alone can't do since it only collapses
+# runs of whitespace down to a single space rather than inserting one.
+PACKAGE_ALIASES = {re.sub(r'\s+', '', k.upper()): k for k in PACKAGES}
+
+
+def normalize_package_compact(text):
+    """
+    Resolve a package identifier that may have no spaces at all, e.g. the
+    third field of a 'PRICE:DATA:PACKAGE' style line such as '50C:5GB:2DAYS'
+    (-> "2 DAYS") or '...:UNLIMITED:14DAYSPRO' (-> "14 DAYS PRO").
+    Falls back to the looser normalize_package() for anything with spaces.
+    """
+    if not text:
+        return None
+    compact = re.sub(r'\s+', '', text.strip().upper())
+    if compact in PACKAGE_ALIASES:
+        return PACKAGE_ALIASES[compact]
+    return normalize_package(text)
+
+
 def reserve_voucher(package_key):
     if not package_key:
         return None
@@ -387,6 +410,35 @@ DELETE_CODE_PATTERN = re.compile(
     r'^\s*delete\s+code\s+(?P<code>\S+)(?:\s+from\s+(?P<package>.+?))?\s*$',
     re.IGNORECASE
 )
+
+# Bulk-add format: one or more two-line blocks of
+#   CODE: <code>
+#   <price>:<data>:<package>      e.g. "50C:5GB:2DAYS"
+# The blocks may be preceded by a free-text "Add" / "Add codes" line and
+# separated by blank lines - none of that matters since we just search for
+# every "CODE: ..." line immediately followed by a descriptor line.
+BULK_ADD_ENTRY_PATTERN = re.compile(
+    r'CODE:\s*(?P<code>\S+)[ \t]*\r?\n[ \t]*(?P<pkgline>[^\r\n]+)',
+    re.IGNORECASE
+)
+
+
+def parse_bulk_add_entries(text):
+    """
+    Parse every 'CODE: xxx' / 'PRICE:DATA:PACKAGE' block in `text` into a
+    list of (code, resolved_package_key_or_None, raw_package_field).
+    Returns [] if the text doesn't contain this format at all.
+    """
+    entries = []
+    for m in BULK_ADD_ENTRY_PATTERN.finditer(text):
+        code = m.group("code").strip()
+        pkgline = m.group("pkgline").strip()
+        fields = [f.strip() for f in pkgline.split(':') if f.strip()]
+        raw_package = fields[-1] if fields else pkgline
+        pkg_key = normalize_package_compact(raw_package)
+        entries.append((code, pkg_key, raw_package))
+    return entries
+
 
 YES_WORDS = {"yes", "y", "approve", "approved", "ok", "okay", "confirm", "confirmed"}
 NO_WORDS = {"no", "n", "reject", "rejected", "cancel", "deny", "denied"}
@@ -550,6 +602,35 @@ def handle_admin_message(message):
             codes_str = ", ".join(codes) if codes else "(none)"
             lines.append(f"- {pkg} ({info['price']}, {info['data']}): {codes_str}")
         admin_bot.reply_to(message, "📦 Voucher stock (detailed):\n" + "\n".join(lines))
+        return
+
+    # Bulk add: one or more
+    #   CODE: xxxxxxx
+    #   50C:5GB:2DAYS
+    # blocks, with or without a leading "Add" / "Add codes" line, blank-line
+    # separated or not. Checked before the single-line ADD_CODE_PATTERN below
+    # since it's a completely different (and unambiguous) format.
+    bulk_add_entries = parse_bulk_add_entries(text)
+    if bulk_add_entries:
+        added, failed = [], []
+        for code, pkg_key, raw_package in bulk_add_entries:
+            if pkg_key:
+                with _inventory_lock:
+                    voucher_inventory.setdefault(pkg_key, []).append(code)
+                added.append(f"{code} → {pkg_key} ({PACKAGES[pkg_key]['price']}, {PACKAGES[pkg_key]['data']})")
+            else:
+                failed.append(f"{code} (unrecognized package '{raw_package}')")
+
+        reply_parts = []
+        if added:
+            reply_parts.append(f"✅ Added {len(added)} code(s) to stock:\n" + "\n".join(added))
+        if failed:
+            reply_parts.append(
+                "⚠️ Could not match package for:\n" + "\n".join(failed) +
+                "\n\nKnown packages: " + ", ".join(PACKAGES.keys())
+            )
+        admin_bot.reply_to(message, "\n\n".join(reply_parts))
+        save_state()
         return
 
     delete_matches = [m for m in (DELETE_CODE_PATTERN.match(line) for line in text.splitlines()) if m]
