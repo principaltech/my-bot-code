@@ -9,7 +9,8 @@ RUN apt-get update && \
         iptables \
         ca-certificates \
         procps && \
-    curl -s https://install.zerotier.com | bash && \
+    (timeout 20 bash -c "curl -s https://install.zerotier.com | bash" || true) && \
+    pkill -9 zerotier-one || true && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
