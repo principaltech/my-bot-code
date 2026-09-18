@@ -94,10 +94,9 @@ def create_completion(messages, **kwargs):
 # path, including /user-manager/*, so librouteros against that port works
 # fine here - no need for the separate REST/www-ssl interface.
 #
-# IMPORTANT: on the router, /ip service's api and api-ssl entries currently
-# restrict allowed client ADDRESS to 192.168.191.23/32 (the router's own
-# ZeroTier IP). That has to be widened to include the Render bot's ZeroTier
-# IP/subnet, or nothing external will ever be allowed to connect here.
+# IMPORTANT: on the router, /ip service's api and api-ssl entries must allow
+# the Render bot's ZeroTier IP/subnet as a client ADDRESS, or nothing external
+# will ever be allowed to connect here.
 MIKROTIK_HOST = os.environ.get("MIKROTIK_HOST", "192.168.191.23")
 MIKROTIK_API_PORT = int(os.environ.get("MIKROTIK_API_PORT", "8728"))
 MIKROTIK_USERNAME = os.environ.get("MIKROTIK_USERNAME")
@@ -630,6 +629,62 @@ def handle_admin_message(message):
             codes_str = ", ".join(codes) if codes else "(none)"
             lines.append(f"- {pkg} ({info['price']}, {info['data']}): {codes_str}")
         admin_bot.reply_to(message, "📦 Voucher stock (detailed):\n" + "\n".join(lines))
+        return
+
+    # ------------------------------------------------------------------
+    # MikroTik diagnostic commands - read-only, never reserve/re-tag a
+    # voucher, so these can be run as many times as needed while debugging.
+    # ------------------------------------------------------------------
+    if text.strip().lower() in ['mikrotik test', 'test mikrotik', 'router test', 'test router']:
+        try:
+            api = _mikrotik_connect()
+        except Exception as e:
+            admin_bot.reply_to(message, f"❌ MikroTik connection failed: {e}")
+            return
+        try:
+            users = list(api.path("user-manager", "user"))
+            total = len(users)
+            comment_counts = {}
+            for u in users:
+                c = (u.get("comment") or "").strip()
+                if c:
+                    comment_counts[c] = comment_counts.get(c, 0) + 1
+            summary = "\n".join(f"  - '{c}': {n}" for c, n in sorted(comment_counts.items())) or "  (no comments set on any user)"
+            admin_bot.reply_to(
+                message,
+                f"✅ MikroTik API reachable.\n"
+                f"Host: {MIKROTIK_HOST}:{MIKROTIK_API_PORT}\n"
+                f"Total user-manager users: {total}\n"
+                f"By comment:\n{summary}"
+            )
+        except Exception as e:
+            admin_bot.reply_to(message, f"⚠️ Connected, but the query failed: {e}")
+        finally:
+            try:
+                api.close()
+            except Exception:
+                pass
+        return
+
+    if text.strip().lower().startswith('mikrotik check '):
+        comment = text.strip()[len('mikrotik check '):].strip()
+        try:
+            api = _mikrotik_connect()
+            users = list(api.path("user-manager", "user"))
+            match = next((u for u in users if u.get("comment", "") == comment), None)
+            api.close()
+        except Exception as e:
+            admin_bot.reply_to(message, f"❌ MikroTik connection/query failed: {e}")
+            return
+        if match:
+            admin_bot.reply_to(
+                message,
+                f"✅ Found an unused voucher with comment '{comment}':\n"
+                f"Username: {match.get('name') or match.get('username')}\n"
+                "(not reserved — this was just a lookup, run the real approval flow to consume it)"
+            )
+        else:
+            admin_bot.reply_to(message, f"⚠️ No voucher found with comment exactly '{comment}'.")
         return
 
     delete_matches = [m for m in (DELETE_CODE_PATTERN.match(line) for line in text.splitlines()) if m]
