@@ -83,6 +83,7 @@ user_memory = {}
 user_last_message_id = {}   
 customer_chat_id = {}       
 customer_display = {}       
+customer_last_code = {}     # Advanced tracking for exact Python-verified code endings
 admin_chat_id = None
 
 # ==========================================
@@ -146,6 +147,7 @@ def save_state():
         "user_last_message_id": user_last_message_id,
         "customer_chat_id": customer_chat_id,
         "customer_display": customer_display,
+        "customer_last_code": customer_last_code,
         "voucher_inventory": voucher_inventory,
         "used_payment_refs": sorted(used_payment_refs),
         "admin_chat_id": admin_chat_id,
@@ -170,6 +172,7 @@ def load_state():
         user_last_message_id.update(snapshot.get("user_last_message_id", {}))
         customer_chat_id.update(snapshot.get("customer_chat_id", {}))
         customer_display.update(snapshot.get("customer_display", {}))
+        customer_last_code.update(snapshot.get("customer_last_code", {}))
         used_payment_refs.update(snapshot.get("used_payment_refs", []))
         for pkg, codes in snapshot.get("voucher_inventory", {}).items():
             voucher_inventory[pkg] = codes
@@ -227,13 +230,14 @@ You are an automated customer care AI assistant for Splash Internet. You MUST fo
 3. PAYMENTS & PROOF OF PAYMENT:
    - EcoCash number is 0776248396.
    - You need three things: (a) the customer's phone number, (b) the package, and (c) proof of payment.
-   - A VALID TRANSACTION REFERENCE MUST BE AT LEAST 7 CHARACTERS LONG. If a user provides a reference that is less than 7 characters (for example, a 4-digit code like "0090"), you MUST reject it. Tell them the code is too short and ask for the FULL exact transaction reference or the full confirmation message.
+   - DISTINGUISH REPLIES: If the user is just answering a question about which package they want (e.g. saying "7d", "7 days", "lite"), DO NOT treat it as a payment reference. Only evaluate transaction references when a full payment confirmation block is provided.
+   - A VALID TRANSACTION REFERENCE MUST BE AT LEAST 7 CHARACTERS LONG. If a user provides a reference that is less than 7 characters as a payment code, reject it.
    - EXTRACTING THE TRANSACTION REFERENCE: Look for the longest alphanumeric string in the message. CODE_ENDING MUST be the EXACT last 7 characters of that full reference. Ignore punctuation like dots or dashes. NEVER accept or use a code shorter than 7 characters.
 4. AFTER PAYMENT PROOF IS SUBMITTED:
    - Tell the user to wait 30 seconds while the payment is validated. That is ALL you say about the outcome.
    - CRITICAL: Do NOT attempt to repeat, quote, or summarize the customer's transaction reference back to them in your conversational reply. The reference must ONLY be output inside the [ADMIN_ALERT] tag.
 5. ADMIN PAYMENT APPROVAL (CRITICAL INSTRUCTION):
-   - When a user submits a VALID proof of payment (minimum 7 chars), generate the exact tag [ADMIN_ALERT] followed immediately by a structured line:
+   - When a user has provided their phone number, package, AND a valid payment reference (minimum 7 chars), generate the exact tag [ADMIN_ALERT] followed immediately by a structured line:
      [ADMIN_ALERT] CODE_ENDING: <exact last 7 characters> | PRICE: $<amount> | PHONE: <customer phone number> | PACKAGE: <package name> - Admin, please provide a voucher code.
    - NEVER generate this alert if the code is under 7 characters.
 6. ADMIN REPLIES:
@@ -336,7 +340,6 @@ def parse_admin_alert(alert_text, user_text=""):
     code_ending = m.group("code").strip(" -\u2014:")
     code_alphanum = re.sub(r'[^A-Za-z0-9]', '', code_ending)
     
-    # If the LLM hallucinated a bad code because of dots/dashes, let the backend's regex save it
     real_ending = extract_code_ending_from_text(user_text)
     
     if real_ending:
@@ -344,7 +347,6 @@ def parse_admin_alert(alert_text, user_text=""):
     elif len(code_alphanum) >= 7:
         final_code = code_alphanum[-7:]
     else:
-        # We couldn't salvage 7 characters either way
         return None
 
     return {
@@ -476,6 +478,11 @@ def handle_customer_message(message):
     customer_chat_id[customer_key] = message.chat.id
     customer_display[customer_key] = display_name_for(message)
 
+    # 1. Deterministic Python Pre-Extraction (Source of Truth)
+    extracted_ref = extract_code_ending_from_text(text)
+    if extracted_ref:
+        customer_last_code[customer_key] = extracted_ref
+
     if customer_key not in user_memory:
         user_memory[customer_key] = [{"role": "system", "content": system_rules}]
 
@@ -512,25 +519,38 @@ def handle_customer_message(message):
                 
                 if parsed:
                     alerts_to_process.append((alert_text, parsed))
+                    if parsed.get("code_ending"):
+                        customer_last_code[customer_key] = parsed["code_ending"]
                 else:
-                    # If parsing failed, see if it was because the LLM pushed a short code 
-                    # AND the backend's regex fallback also failed to find a valid code
                     m = re.search(r'CODE_ENDING:\s*([^|]+)', alert_text, re.IGNORECASE)
                     if m:
                         raw_c = re.sub(r'[^A-Za-z0-9]', '', m.group(1))
                         if raw_c and len(raw_c) < 7:
                             short_code_detected = True
-                            continue # Kill this alert
+                            continue 
                     
                     alerts_to_process.append((alert_text, None))
 
-        # HARD BACKEND GUARD: Instantly intercept and override AI if a short code was pushed 
-        # without a backend fallback
-        if short_code_detected:
+        is_likely_ref_attempt = any(kw in text.lower() for kw in ["pp", "code", "ref", "trans", "sent to"]) or len(re.sub(r'[^0-9]', '', text)) >= 4
+
+        if short_code_detected and is_likely_ref_attempt:
             clean_reply = "⚠️ The transaction reference provided is too short. A valid approval code must be at least 7 characters long. Please send the FULL exact transaction reference."
+            alerts_to_process = []
+        elif short_code_detected and not is_likely_ref_attempt:
             alerts_to_process = []
         elif not clean_reply and (alerts_to_process or tampered):
             clean_reply = WAIT_MESSAGE if alerts_to_process else NEED_PROOF_MESSAGE
+
+        # Python Templating Enforcement: If the AI mentions an approval code ending, strictly enforce Python's exact verified value
+        if customer_key in customer_last_code and ("code ending" in clean_reply.lower() or "approval code" in clean_reply.lower()):
+            true_ending = customer_last_code[customer_key]
+            # Replace any hallucinated code ending sequence with the true Python-extracted string
+            clean_reply = re.sub(
+                r'(Approval Code ending\s*\**\s*)[A-Za-z0-9]+(\s*\**)',
+                rf'\1**{true_ending}**\2',
+                clean_reply,
+                flags=re.IGNORECASE
+            )
 
         duplicate_notice = False
 
@@ -606,7 +626,6 @@ def handle_customer_message(message):
             clean_reply = ensure_closing_warning(clean_reply)
             history_entry = clean_reply
             
-            # Keep AI context clean from fake memory loops
             if alerts_to_process and not duplicate_notice:
                 history_entry += "".join(f"\n[ADMIN_ALERT]{a[0]}" for a in alerts_to_process)
             user_memory[customer_key].append({"role": "assistant", "content": history_entry})
