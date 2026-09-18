@@ -413,6 +413,42 @@ def normalize_package_compact(text):
         return PACKAGE_ALIASES[compact]
     return normalize_package(text)
 
+# Informal / lenient package matching specifically for raw customer messages. Handles:
+#  - a package name embedded with no whitespace inside a longer message, e.g. the message
+#    starting with "7days: Transfer Confirmation: ..." (normalize_package's substring check
+#    requires the space in "7 DAYS", which "7days" without a space never satisfies)
+#  - informal shorthand like "7d", "24h", "2 days"
+PACKAGE_DURATION_MAP = {
+    ("24", "h"): "24 HOURS LITE",
+    ("2", "d"): "2 DAYS",
+    ("7", "d"): "7 DAYS",
+    ("14", "d"): "14 DAYS PRO",
+    ("30", "d"): "30 DAYS LITE",
+}
+DURATION_RE = re.compile(r'\b(\d{1,2})\s*-?\s*(days?|d|hours?|hrs?|h)\b', re.IGNORECASE)
+
+def extract_package_from_duration(text):
+    if not text:
+        return None
+    m = DURATION_RE.search(text)
+    if not m:
+        return None
+    num = m.group(1)
+    unit = "h" if m.group(2).lower().startswith("h") else "d"
+    return PACKAGE_DURATION_MAP.get((num, unit))
+
+def extract_customer_package(text):
+    if not text:
+        return None
+    pkg = normalize_package(text)
+    if pkg:
+        return pkg
+    compact = re.sub(r'\s+', '', text.strip().upper())
+    compact_matches = {p for alias, p in PACKAGE_ALIASES.items() if alias in compact}
+    if len(compact_matches) == 1:
+        return next(iter(compact_matches))
+    return extract_package_from_duration(text)
+
 def reserve_voucher(package_key):
     if not package_key:
         return None
@@ -507,7 +543,7 @@ def handle_customer_message(message):
     # 1. Deterministic Python Pre-Extraction & Slot Management
     extracted_ref = extract_code_ending_from_text(text)
     extracted_phone = extract_phone_from_text(text)
-    extracted_pkg = normalize_package(text)
+    extracted_pkg = extract_customer_package(text)
 
     # Make sure conversation memory exists before we possibly inject a system note below.
     if customer_key not in user_memory:
@@ -648,41 +684,46 @@ def handle_customer_message(message):
         elif not clean_reply and (alerts_to_process or tampered):
             clean_reply = WAIT_MESSAGE if alerts_to_process else NEED_PROOF_MESSAGE
 
-        # GUARD + Templating Enforcement, combined and made STRUCTURAL rather than wording-based.
+        # GUARD + Templating Enforcement.
         #
-        # A real "payment received" confirmation can only be genuine if THIS turn actually
-        # extracted a new reference from the customer's own message, or produced a real admin
-        # alert. Anything else claiming a code/approval-code reference is, by construction, the
-        # model recalling an OLD exchange from chat history - regardless of how it phrases it
-        # ("please wait 30 seconds", "please hold on", "we are confirming", etc). We do not try
-        # to pattern-match every possible phrasing the model might use; instead we key off the
-        # one thing that must never appear without genuine backing: a mention of a code/approval
-        # reference at all.
+        # The failure mode we're guarding against is specifically: the model claiming a NEW
+        # payment was JUST received/is now being validated, when nothing genuine happened this
+        # turn (no reference extracted, no admin alert generated). That is fabrication, built
+        # from the model recalling an old exchange in chat history.
+        #
+        # That is NOT the same as the model simply referencing an EXISTING, still-open pending
+        # transaction to ask for missing info ("I see your code ending X, please also confirm
+        # your package") - that's a legitimate, honest continuation, and blocking it breaks
+        # ordinary slot-filling conversations. So a mention of "code ending" is only suspect when
+        # there's no currently-open pending transaction for this customer AND nothing genuine
+        # happened this specific turn.
+        active_pending = pending_approvals.get(customer_key)
+        has_open_pending = bool(active_pending)
         genuine_receipt_this_turn = bool(extracted_ref) or bool(alerts_to_process)
-        mentions_code_reference = (
+        implies_new_receipt = bool(clean_reply) and bool(FAKE_RECEIPT_RE.search(clean_reply))
+        mentions_code_reference = bool(clean_reply) and (
             "code ending" in clean_reply.lower() or "approval code" in clean_reply.lower()
         )
 
-        if clean_reply and mentions_code_reference and not genuine_receipt_this_turn:
+        if implies_new_receipt and not genuine_receipt_this_turn:
+            print(f"[GUARD] Blocked a reply falsely claiming a NEW payment was just received for "
+                  f"{customer_key} (no new proof extracted and no admin alert generated this turn).")
+            clean_reply = NO_GENUINE_PROOF_MESSAGE
+        elif mentions_code_reference and not (genuine_receipt_this_turn or has_open_pending):
             print(f"[GUARD] Blocked a reply referencing a code/approval reference for {customer_key} "
-                  "with no genuine proof extracted and no admin alert generated this turn.")
+                  "with no open pending transaction and no genuine proof this turn.")
             clean_reply = NO_GENUINE_PROOF_MESSAGE
-        elif clean_reply and mentions_code_reference and customer_key in customer_last_code:
-            # Genuine case: enforce Python's exact verified value rather than whatever the model wrote.
-            true_ending = customer_last_code[customer_key]
-            clean_reply = re.sub(
-                r'(Approval Code ending\s*\**\s*)[A-Za-z0-9]+(\s*\**)',
-                rf'\1**{true_ending}**\2',
-                clean_reply,
-                flags=re.IGNORECASE
-            )
-
-        # Secondary, best-effort catch: a fabricated "payment received / please wait" reply that
-        # doesn't even mention "code ending" but still falsely implies proof was just received.
-        if clean_reply and not genuine_receipt_this_turn and FAKE_RECEIPT_RE.search(clean_reply):
-            print(f"[GUARD] Blocked a fabricated 'payment received' reply for {customer_key} "
-                  "(no new proof extracted and no admin alert generated this turn).")
-            clean_reply = NO_GENUINE_PROOF_MESSAGE
+        elif mentions_code_reference:
+            # Genuine case (fresh this turn, or honestly continuing an already-open transaction):
+            # enforce Python's exact verified code value rather than whatever the model wrote.
+            true_ending = (active_pending or {}).get("code_ending") or customer_last_code.get(customer_key)
+            if true_ending:
+                clean_reply = re.sub(
+                    r'(Approval Code ending\s*\**\s*)[A-Za-z0-9]+(\s*\**)',
+                    rf'\1**{true_ending}**\2',
+                    clean_reply,
+                    flags=re.IGNORECASE
+                )
 
         duplicate_notice = False
 
@@ -1127,6 +1168,7 @@ def run_admin_bot():
 
 if __name__ == "__main__":
     load_state()
+    print("[VERSION] splash_bot.py — build with lenient package matching + open-pending guard fix")
     print(f"[Groq] Loaded {len(groq_clients)} API key(s) for rotation/fallback.")
     Thread(target=run_customer_bot).start()
     Thread(target=run_admin_bot).start()
