@@ -622,6 +622,29 @@ def handle_customer_left(message):
 # ==========================================
 # BOT 2: ADMIN BOT HANDLER
 # ==========================================
+
+# Invisible Unicode characters that phone keyboards / copy-paste often put in
+# front of a command (e.g. U+200E "left-to-right mark" before the '/').
+# str.strip() does NOT remove these, so "\u200e/listcodes" would never match
+# "/listcodes" and would fall through to the customer-matching logic.
+INVISIBLE_CHARS_RE = re.compile(r'[\u200e\u200f\u200b\u200c\u200d\u2060\ufeff\u202a-\u202e]')
+
+# Admin commands for viewing stock. Anything in these sets is matched
+# case-insensitively after clean_admin_text() has normalised the message.
+STOCK_COMMANDS = {'stock', '/stock', 'inventory', '/inventory'}
+STOCK_FULL_COMMANDS = {
+    'stock full', 'stock detail', 'list codes',
+    '/stockfull', '/stockdetail', '/orstockdetail', '/listcodes', '/codes',
+}
+
+
+def clean_admin_text(raw):
+    """Remove invisible characters, trim, and drop any @BotName suffix
+    (e.g. '/codes@MyAdminBot' -> '/codes')."""
+    text = INVISIBLE_CHARS_RE.sub('', raw or '').strip()
+    return re.sub(r'^(/\w+)@\w+', r'\1', text)
+
+
 @admin_bot.message_handler(func=lambda message: True)
 def handle_admin_message(message):
     global admin_chat_id
@@ -638,7 +661,9 @@ def handle_admin_message(message):
         return
 
     admin_chat_id = message.chat.id
-    text = message.text.strip()
+    text = clean_admin_text(message.text)
+    if not text:
+        return
 
     if text.lower() in ['/start', 'hello', 'hi', 'link']:
         admin_bot.reply_to(message, f"✅ Admin Link Active! (Your ID: {admin_chat_id})\nReady to receive and route vouchers.")
@@ -656,7 +681,7 @@ def handle_admin_message(message):
             admin_awaiting[admin_chat_id] = 'add_code'
         admin_bot.reply_to(
             message,
-            "✏️ Send the code to add, in this format:\n<code> for <package>\n\nExample: A1B2C3 for 7 DAYS"
+            "✏️ Type a code to be added, followed by its package:\n<code> for <package>\n\nExample: 6786gfr for 7 DAYS"
         )
         return
 
@@ -665,18 +690,20 @@ def handle_admin_message(message):
             admin_awaiting[admin_chat_id] = 'delete_code'
         admin_bot.reply_to(
             message,
-            "✏️ Send the code to delete. Optionally add the package too:\n<code>\nor: <code> from <package>"
+            "✏️ Type a code to be deleted.\nOptionally add the package: <code> from <package>"
         )
         return
 
     awaiting = None
     with _admin_state_lock:
-        # Only consume the awaiting state for a plain follow-up reply - if
-        # the admin instead types another slash command, let it fall
-        # through to normal command handling below and drop the pending
-        # guided flow rather than misinterpreting the command as a code.
-        if admin_chat_id in admin_awaiting and not text.startswith('/'):
-            awaiting = admin_awaiting.pop(admin_chat_id)
+        # Typing any other slash command cancels a half-finished /addcode or
+        # /deletecode (so it can't stay armed and swallow a later message),
+        # and lets the command fall through to normal handling below. A plain
+        # follow-up message consumes the awaiting state as the code itself.
+        if text.startswith('/'):
+            admin_awaiting.pop(admin_chat_id, None)
+        else:
+            awaiting = admin_awaiting.pop(admin_chat_id, None)
 
     if awaiting == 'add_code':
         m = ADD_CODE_SHORT_PATTERN.match(text)
@@ -720,7 +747,7 @@ def handle_admin_message(message):
             admin_bot.reply_to(message, f"⚠️ Not found in stock (already used, wrong package, or typo): {code}")
         return
 
-    if text.strip().lower() in ['stock', '/stock', 'inventory', '/inventory']:
+    if text.lower() in STOCK_COMMANDS:
         lines = [
             f"- {pkg} ({info['price']}, {info['data']}): {len(voucher_inventory.get(pkg, []))} code(s)"
             for pkg, info in PACKAGES.items()
@@ -728,14 +755,11 @@ def handle_admin_message(message):
         admin_bot.reply_to(
             message,
             "📦 Voucher stock:\n" + "\n".join(lines) +
-            "\n\nSend 'stock full' to see the actual codes."
+            "\n\nSend /stockfull to see the actual codes."
         )
         return
 
-    if text.strip().lower() in [
-        'stock full', 'stock detail', 'list codes', '/codes',
-        '/stockfull', '/orstockdetail', '/listcodes'
-    ]:
+    if text.lower() in STOCK_FULL_COMMANDS:
         lines = []
         for pkg, info in PACKAGES.items():
             codes = voucher_inventory.get(pkg, [])
@@ -821,6 +845,18 @@ def handle_admin_message(message):
             )
         admin_bot.reply_to(message, "\n\n".join(reply_parts))
         save_state()
+        return
+
+    # Safety guard: any unrecognized '/something' must NOT fall through to the
+    # "treat this as a voucher code" logic below, otherwise (with exactly one
+    # customer pending) the bot could send e.g. "/stockdetail" to a customer
+    # as their voucher code.
+    if text.startswith('/'):
+        admin_bot.reply_to(
+            message,
+            "⚠️ Unknown command. Available:\n"
+            "/stock, /stockfull, /stockdetail, /listcodes, /codes, /addcode, /deletecode"
+        )
         return
 
     target_key = find_target_customer(text)
