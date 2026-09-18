@@ -6,6 +6,7 @@ import sqlite3
 from flask import Flask
 from threading import Thread, Lock
 from groq import Groq
+import librouteros
 
 # Tokens
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")       # Bot 1: Customer Bot
@@ -82,6 +83,83 @@ def create_completion(messages, **kwargs):
             continue
 
     raise last_error
+
+
+# ==========================================
+# MIKROTIK USER MANAGER (voucher codes over ZeroTier)
+# ==========================================
+# RouterOS 7 User Manager lives under the "/user-manager" console menu
+# (RouterOS 6's old "/tool/user-manager" path does not exist in v7).
+# The classic RouterOS binary API (port 8728/8729) can execute any console
+# path, including /user-manager/*, so librouteros against that port works
+# fine here - no need for the separate REST/www-ssl interface.
+#
+# IMPORTANT: on the router, /ip service's api and api-ssl entries currently
+# restrict allowed client ADDRESS to 192.168.191.23/32 (the router's own
+# ZeroTier IP). That has to be widened to include the Render bot's ZeroTier
+# IP/subnet, or nothing external will ever be allowed to connect here.
+MIKROTIK_HOST = os.environ.get("MIKROTIK_HOST", "192.168.191.23")
+MIKROTIK_API_PORT = int(os.environ.get("MIKROTIK_API_PORT", "8728"))
+MIKROTIK_USERNAME = os.environ.get("MIKROTIK_USERNAME")
+MIKROTIK_PASSWORD = os.environ.get("MIKROTIK_PASSWORD")
+
+_mikrotik_lock = Lock()
+
+
+def _mikrotik_connect():
+    """Fresh connection per call rather than a kept-open socket - Render
+    containers restart often, and User Manager lookups are infrequent
+    enough that reconnecting each time costs nothing noticeable."""
+    if not (MIKROTIK_USERNAME and MIKROTIK_PASSWORD):
+        raise RuntimeError("MIKROTIK_USERNAME/MIKROTIK_PASSWORD not set")
+    return librouteros.connect(
+        host=MIKROTIK_HOST,
+        username=MIKROTIK_USERNAME,
+        password=MIKROTIK_PASSWORD,
+        port=MIKROTIK_API_PORT,
+        timeout=8,
+    )
+
+
+def fetch_um_code(comment):
+    """
+    Pull one unused User Manager voucher whose comment exactly matches
+    `comment`, and immediately re-tag it on the router so it can never
+    be handed out twice - even if two admins approve at the same moment.
+    Returns the username (the code customers type in), or None if
+    nothing is available under that comment or the router is unreachable.
+    """
+    with _mikrotik_lock:
+        try:
+            api = _mikrotik_connect()
+        except Exception as e:
+            print(f"[MikroTik] Connection failed: {e}")
+            return None
+
+        try:
+            users = list(api.path("user-manager", "user"))
+            candidates = [u for u in users if u.get("comment", "") == comment]
+            if not candidates:
+                return None
+
+            chosen = candidates[0]
+            username = chosen.get("name") or chosen.get("username")
+            user_id = chosen.get(".id")
+
+            # Re-tag instead of delete, so Winbox keeps an audit trail
+            # of which codes were actually issued.
+            api.path("user-manager", "user").update(
+                **{".id": user_id, "comment": f"{comment} USED"}
+            )
+            return username
+        except Exception as e:
+            print(f"[MikroTik] User Manager lookup failed: {e}")
+            return None
+        finally:
+            try:
+                api.close()
+            except Exception:
+                pass
 
 
 # ==========================================
@@ -356,7 +434,9 @@ def reserve_voucher(package_key):
         codes = voucher_inventory.get(package_key)
         if codes:
             return codes.pop(0)
-    return None
+    # Local stock empty - fall back to MikroTik User Manager over
+    # ZeroTier, filtered by a comment matching the package name.
+    return fetch_um_code(package_key)
 
 
 def return_voucher(package_key, code):
