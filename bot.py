@@ -3,6 +3,7 @@ import os
 import re
 import json
 import sqlite3
+import time
 from flask import Flask
 from threading import Thread, Lock
 from groq import Groq
@@ -1198,15 +1199,44 @@ def home():
     return "Dual-Bot System Running!"
 
 def run_customer_bot():
-    customer_bot.infinity_polling()
+    # Watchdog: pyTelegramBotAPI's infinity_polling() is *supposed* to retry forever on any
+    # exception, but a 409 Conflict from getUpdates (e.g. during a Render rolling deploy, where
+    # the old instance briefly overlaps with the new one) can escape that internal retry and
+    # kill this thread silently - Flask keeps answering health checks, so the service looks
+    # "up" on Render, but nothing is actually polling Telegram anymore. This outer loop makes
+    # sure polling always restarts instead of dying quietly.
+    while True:
+        try:
+            customer_bot.remove_webhook()  # clears any stray webhook that could also cause 409s
+        except Exception as e:
+            print(f"[Customer Bot] remove_webhook failed (continuing anyway): {e}")
+        try:
+            print("[Customer Bot] Starting polling...")
+            customer_bot.infinity_polling(timeout=20, long_polling_timeout=20)
+        except Exception as e:
+            print(f"[Customer Bot] Polling crashed: {e}")
+        print("[Customer Bot] Polling stopped/crashed - restarting in 5s...")
+        time.sleep(5)
 
 def run_admin_bot():
-    admin_bot.infinity_polling()
+    while True:
+        try:
+            admin_bot.remove_webhook()
+        except Exception as e:
+            print(f"[Admin Bot] remove_webhook failed (continuing anyway): {e}")
+        try:
+            print("[Admin Bot] Starting polling...")
+            admin_bot.infinity_polling(timeout=20, long_polling_timeout=20)
+        except Exception as e:
+            print(f"[Admin Bot] Polling crashed: {e}")
+        print("[Admin Bot] Polling stopped/crashed - restarting in 5s...")
+        time.sleep(5)
 
 if __name__ == "__main__":
+    import sys
+    print("[VERSION] splash_bot.py — build with lenient package matching + open-pending guard fix", flush=True)
     load_state()
-    print("[VERSION] splash_bot.py — build with lenient package matching + open-pending guard fix")
-    print(f"[Groq] Loaded {len(groq_clients)} API key(s) for rotation/fallback.")
+    print(f"[Groq] Loaded {len(groq_clients)} API key(s) for rotation/fallback.", flush=True)
     Thread(target=run_customer_bot).start()
     Thread(target=run_admin_bot).start()
     port = int(os.environ.get('PORT', 5000))
