@@ -228,7 +228,7 @@ You are an automated customer care AI assistant for Splash Internet. You MUST fo
    - EcoCash number is 0776248396.
    - You need three things: (a) the customer's phone number, (b) the package, and (c) proof of payment.
    - A VALID TRANSACTION REFERENCE MUST BE AT LEAST 7 CHARACTERS LONG. If a user provides a reference that is less than 7 characters (for example, a 4-digit code like "0090"), you MUST reject it. Tell them the code is too short and ask for the FULL exact transaction reference or the full confirmation message.
-   - EXTRACTING THE TRANSACTION REFERENCE: CODE_ENDING MUST be the EXACT last 7 characters of the full reference (letters and digits only). NEVER accept or use a code shorter than 7 characters.
+   - EXTRACTING THE TRANSACTION REFERENCE: Look for the longest alphanumeric string in the message. CODE_ENDING MUST be the EXACT last 7 characters of that full reference. Ignore punctuation like dots or dashes. NEVER accept or use a code shorter than 7 characters.
 4. AFTER PAYMENT PROOF IS SUBMITTED:
    - Tell the user to wait 30 seconds while the payment is validated. That is ALL you say about the outcome.
 5. ADMIN PAYMENT APPROVAL (CRITICAL INSTRUCTION):
@@ -306,29 +306,6 @@ def note_voucher_delivered(history, package):
         )
     })
 
-def parse_admin_alert(alert_text):
-    pattern = re.compile(
-        r'CODE_ENDING:\s*(?P<code>[^|]+)\|\s*PRICE:\s*(?P<price>[^|]+)\|\s*PHONE:\s*(?P<phone>[^|]+)\|\s*PACKAGE:\s*(?P<package>[^\n]+)',
-        re.IGNORECASE
-    )
-    m = pattern.search(alert_text)
-    if not m:
-        return None
-        
-    code_ending = m.group("code").strip(" -\u2014:")
-    code_alphanum = re.sub(r'[^A-Za-z0-9]', '', code_ending)
-    
-    # Strictly reject at the parser level if the code is shorter than 7 characters
-    if len(code_alphanum) < 7:
-        return None
-
-    return {
-        "code_ending": code_alphanum[-7:],
-        "price": m.group("price").strip(" -\u2014:"),
-        "phone": m.group("phone").strip(" -\u2014:"),
-        "package": re.split(r'[\u2014-]', m.group("package"))[0].strip(),
-    }
-
 TRANSACTION_REF_PATTERN = re.compile(
     r'(?:approval\s*code|transaction\s*id|trans(?:action)?\s*ref(?:erence)?|confirmation\s*code|ref(?:erence)?\s*(?:no\.?|number)?)\s*[:#]?\s*'
     r'([A-Za-z0-9][A-Za-z0-9.\-]{6,})',
@@ -345,6 +322,36 @@ def extract_code_ending_from_text(text):
     if len(raw) >= 7:
         return raw[-7:]
     return None
+
+def parse_admin_alert(alert_text, user_text=""):
+    pattern = re.compile(
+        r'CODE_ENDING:\s*(?P<code>[^|]+)\|\s*PRICE:\s*(?P<price>[^|]+)\|\s*PHONE:\s*(?P<phone>[^|]+)\|\s*PACKAGE:\s*(?P<package>[^\n]+)',
+        re.IGNORECASE
+    )
+    m = pattern.search(alert_text)
+    if not m:
+        return None
+        
+    code_ending = m.group("code").strip(" -\u2014:")
+    code_alphanum = re.sub(r'[^A-Za-z0-9]', '', code_ending)
+    
+    # If the LLM hallucinated a bad code because of dots/dashes, let the backend's regex save it
+    real_ending = extract_code_ending_from_text(user_text)
+    
+    if real_ending:
+        final_code = real_ending
+    elif len(code_alphanum) >= 7:
+        final_code = code_alphanum[-7:]
+    else:
+        # We couldn't salvage 7 characters either way
+        return None
+
+    return {
+        "code_ending": final_code,
+        "price": m.group("price").strip(" -\u2014:"),
+        "phone": m.group("phone").strip(" -\u2014:"),
+        "package": re.split(r'[\u2014-]', m.group("package"))[0].strip(),
+    }
 
 def find_target_customer(admin_text):
     digits_in_text = re.findall(r'[A-Za-z0-9]{7,}', admin_text)
@@ -500,12 +507,13 @@ def handle_customer_message(message):
         if alerts:
             for alert_text in alerts:
                 alert_text = alert_text.strip()
-                parsed = parse_admin_alert(alert_text)
+                parsed = parse_admin_alert(alert_text, text)
                 
                 if parsed:
                     alerts_to_process.append((alert_text, parsed))
                 else:
-                    # Check if the alert failed because the LLM tried to push a short <7 digit code
+                    # If parsing failed, see if it was because the LLM pushed a short code 
+                    # AND the backend's regex fallback also failed to find a valid code
                     m = re.search(r'CODE_ENDING:\s*([^|]+)', alert_text, re.IGNORECASE)
                     if m:
                         raw_c = re.sub(r'[^A-Za-z0-9]', '', m.group(1))
@@ -513,10 +521,10 @@ def handle_customer_message(message):
                             short_code_detected = True
                             continue # Kill this alert
                     
-                    # If it failed to parse for formatting reasons, fallback to unparsed
                     alerts_to_process.append((alert_text, None))
 
-        # HARD BACKEND GUARD: Instantly intercept and override AI if it pushed a short code
+        # HARD BACKEND GUARD: Instantly intercept and override AI if a short code was pushed 
+        # without a backend fallback
         if short_code_detected:
             clean_reply = "⚠️ The transaction reference provided is too short. A valid approval code must be at least 7 characters long. Please send the FULL exact transaction reference."
             alerts_to_process = []
@@ -531,10 +539,6 @@ def handle_customer_message(message):
                     label = customer_display.get(customer_key, str(customer_key))
 
                     if parsed:
-                        real_ending = extract_code_ending_from_text(text)
-                        if real_ending:
-                            parsed["code_ending"] = real_ending
-
                         fp = payment_fingerprint(parsed)
 
                         if fp and fp in used_payment_refs:
