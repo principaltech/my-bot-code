@@ -235,9 +235,12 @@ def display_name_for(message):
 #    "proposed_code": "..." or None, "package_key": "..." or None}
 pending_approvals = {}
 
-# Fingerprints (code_ending|price|phone) of payment proofs that have ALREADY
-# been redeemed for a voucher. Stops the same proof of payment being replayed
-# (or the AI re-raising an alert for it) to pull a second voucher out of stock.
+# Fingerprints of the approval/transaction code (its last 7 characters) that
+# have ALREADY been redeemed for a voucher. Deliberately keyed on the code
+# alone - NOT on phone number or price - so a customer paying again with a
+# fresh, legitimate transaction (same phone, same package) is never wrongly
+# treated as a duplicate. Only a repeat of the exact same reference code
+# (a replayed proof-of-payment) is caught here.
 used_payment_refs = set()
 
 # Tracks admins who just typed a bare '/addcode' or '/deletecode' and are
@@ -276,15 +279,15 @@ You are an automated customer care AI assistant for Splash Internet. You MUST fo
    - 30 DAYS LITE = USD $10.00 = UNLIMITED
 3. PAYMENTS & PROOF OF PAYMENT:
    - EcoCash number is 0776248396.
-   - You need three things: (a) the customer's phone number, (b) the package, and (c) proof of payment (a confirmation message or the last 4 digits of the transaction/reference).
+   - You need three things: (a) the customer's phone number, (b) the package, and (c) proof of payment (a confirmation message or the last 7 digits of the transaction/reference).
    - The package can be stated directly by the customer, OR inferred from the amount they paid. If the amount matches EXACTLY ONE package price, treat that as confirmed automatically - do NOT ask the customer to confirm it again, that wastes their time. Just state which package you matched them to and move straight on to rule 4 and rule 5 in the same reply.
    - Only ask a clarifying question about the package if the amount paid matches more than one package price (e.g. $1.00 = both 24 HOURS LITE and 7 DAYS) or matches no known price at all.
-   - EXTRACTING THE TRANSACTION REFERENCE: proof-of-payment messages often contain a labelled reference such as "Approval Code: PP260917.1524.T3000820", "Transaction ID: ...", "Ref: ...", or "Confirmation code: ...". When such a label is present, CODE_ENDING MUST be the last 4 characters of that specific code (letters and digits only, ignore punctuation) - e.g. "T3000820" -> "0820". Do NOT substitute the phone number's last 4 digits when a transaction reference is present, even if it looks unfamiliar or contains letters. Only use the phone number's last 4 digits as a last resort when the customer's message contains no transaction/approval/reference code at all.
+   - EXTRACTING THE TRANSACTION REFERENCE: proof-of-payment messages often contain a labelled reference such as "Approval Code: PP260917.1524.T3000820", "Transaction ID: ...", "Ref: ...", or "Confirmation code: ...". When such a label is present, CODE_ENDING MUST be the last 7 characters of that specific code (letters and digits only, ignore punctuation) - e.g. "T3000820" -> "3000820". Do NOT substitute the phone number's last 7 digits when a transaction reference is present, even if it looks unfamiliar or contains letters. Only use the phone number's last 7 digits as a last resort when the customer's message contains no transaction/approval/reference code at all.
 4. AFTER PAYMENT PROOF IS SUBMITTED:
    - Tell the user to wait 30 seconds while the payment is validated. That is ALL you say about the outcome - see rule 9.
 5. ADMIN PAYMENT APPROVAL (CRITICAL INSTRUCTION):
    - When a user submits proof of payment, you MUST generate the exact tag [ADMIN_ALERT] followed immediately by a structured line in EXACTLY this format (pipe-separated, one line, then your own short note after a dash):
-     [ADMIN_ALERT] CODE_ENDING: <last 4 characters of the transaction/approval reference, or phone last 4 if truly no reference was given> | PRICE: $<amount> | PHONE: <customer phone number> | PACKAGE: <package name> - Admin, please provide a voucher code.
+     [ADMIN_ALERT] CODE_ENDING: <last 7 characters of the transaction/approval reference, or phone last 7 digits if truly no reference was given> | PRICE: $<amount> | PHONE: <customer phone number> | PACKAGE: <package name> - Admin, please provide a voucher code.
    - Fill in every field. If you used the phone number instead of a transaction reference, say so explicitly in your note.
    - The system automatically checks real voucher stock for you - you do not need to track or remember whether a code is available. Just always send an accurate alert; the backend and admin decide what happens next.
    - Send the [ADMIN_ALERT] only ONCE per payment. If the customer sends a follow-up message about a payment you already alerted the admin about, do NOT send another [ADMIN_ALERT]; just tell them to keep waiting.
@@ -370,16 +373,22 @@ def ensure_closing_warning(text):
 
 
 def payment_fingerprint(info):
-    """Stable identity of a payment proof: transaction ending + amount + phone.
-    Returns None if there isn't enough information to fingerprint safely."""
+    """Stable identity of a payment proof, based ONLY on the last 7
+    characters of the approval/transaction reference (CODE_ENDING).
+
+    Phone number and price are deliberately NOT part of this. A customer
+    who pays again later - same phone, same package - is making a new,
+    legitimate purchase with its own transaction reference, and must not be
+    blocked as a "duplicate" just because the phone/price match a previous
+    payment. Only seeing the *same* reference code a second time (a replayed
+    or resubmitted proof of payment) counts as an actual duplicate.
+    """
     if not info:
         return None
     ending = re.sub(r'[^a-z0-9]', '', (info.get("code_ending") or "").lower())
-    phone = re.sub(r'\D', '', info.get("phone") or "")
-    price = re.sub(r'[^0-9.]', '', info.get("price") or "")
-    if not ending or not phone:
+    if not ending:
         return None
-    return f"{ending}|{price}|{phone}"
+    return ending
 
 
 def mark_payment_used(info):
@@ -435,16 +444,17 @@ TRANSACTION_REF_PATTERN = re.compile(
 
 
 def extract_code_ending_from_text(text):
-    """Return the last 4 alphanumeric characters of a labelled transaction
-    reference found in `text`, or None if no such reference is present."""
+    """Return the last 7 alphanumeric characters of a labelled transaction
+    reference found in `text`, or None if no such reference (of at least 7
+    alphanumeric characters) is present."""
     if not text:
         return None
     m = TRANSACTION_REF_PATTERN.search(text)
     if not m:
         return None
     raw = re.sub(r'[^A-Za-z0-9]', '', m.group(1))
-    if len(raw) >= 4:
-        return raw[-4:]
+    if len(raw) >= 7:
+        return raw[-7:]
     return None
 
 
@@ -690,6 +700,9 @@ def handle_customer_message(message):
                         fp = payment_fingerprint(parsed)
 
                         # Already redeemed? Don't reserve/issue another voucher.
+                        # This is keyed ONLY on the approval-code fingerprint,
+                        # so a second legitimate payment (same phone/package,
+                        # new transaction reference) is never blocked here.
                         if fp and fp in used_payment_refs:
                             duplicate_notice = True
                             admin_bot.send_message(
