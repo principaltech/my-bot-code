@@ -226,16 +226,15 @@ You are an automated customer care AI assistant for Splash Internet. You MUST fo
    - 30 DAYS LITE = USD $10.00 = UNLIMITED
 3. PAYMENTS & PROOF OF PAYMENT:
    - EcoCash number is 0776248396.
-   - You need three things: (a) the customer's phone number, (b) the package, and (c) proof of payment (the confirmation message or the exact transaction/reference code).
-   - The package can be stated directly by the customer, OR inferred from the amount they paid. If the amount matches EXACTLY ONE package price, treat that as confirmed automatically.
-   - EXTRACTING THE TRANSACTION REFERENCE: proof-of-payment messages contain a labelled reference such as "Approval Code: PP260917.1524.T3000820", "Transaction ID: ...", "Ref: ...", or "Confirmation code: ...". CODE_ENDING MUST be the EXACT last 7 characters of that specific code (letters and digits only, ignore punctuation) - e.g. "T3000820" -> "3000820". Do NOT use the phone number's digits for the code ending. ONLY track by the last 7 characters/digits of the approval code.
+   - You need three things: (a) the customer's phone number, (b) the package, and (c) proof of payment.
+   - A VALID TRANSACTION REFERENCE MUST BE AT LEAST 7 CHARACTERS LONG. If a user provides a reference that is less than 7 characters (for example, a 4-digit code like "0090"), you MUST reject it. Tell them the code is too short and ask for the FULL exact transaction reference or the full confirmation message.
+   - EXTRACTING THE TRANSACTION REFERENCE: CODE_ENDING MUST be the EXACT last 7 characters of the full reference (letters and digits only). NEVER accept or use a code shorter than 7 characters.
 4. AFTER PAYMENT PROOF IS SUBMITTED:
    - Tell the user to wait 30 seconds while the payment is validated. That is ALL you say about the outcome.
 5. ADMIN PAYMENT APPROVAL (CRITICAL INSTRUCTION):
-   - When a user submits proof of payment, you MUST generate the exact tag [ADMIN_ALERT] followed immediately by a structured line in EXACTLY this format (pipe-separated, one line, then your own short note after a dash):
-     [ADMIN_ALERT] CODE_ENDING: <exact last 7 characters of the transaction/approval reference> | PRICE: $<amount> | PHONE: <customer phone number> | PACKAGE: <package name> - Admin, please provide a voucher code.
-   - Fill in every field accurately.
-   - Send the [ADMIN_ALERT] only ONCE per payment.
+   - When a user submits a VALID proof of payment (minimum 7 chars), generate the exact tag [ADMIN_ALERT] followed immediately by a structured line:
+     [ADMIN_ALERT] CODE_ENDING: <exact last 7 characters> | PRICE: $<amount> | PHONE: <customer phone number> | PACKAGE: <package name> - Admin, please provide a voucher code.
+   - NEVER generate this alert if the code is under 7 characters.
 6. ADMIN REPLIES:
    - You will never need to interpret or forward admin replies yourself. The backend handles this.
 7. MANDATORY CLOSING WARNING:
@@ -283,10 +282,6 @@ def ensure_closing_warning(text):
     return f"{text}\n\n{CLOSING_WARNING}"
 
 def payment_fingerprint(info):
-    """
-    Enforce strictly EXACTLY 7 characters for tracking to stop 4-digit mismatches.
-    If it's less than 7 characters, it does not trigger the duplicate trap.
-    """
     if not info:
         return None
     ending = re.sub(r'[^a-z0-9]', '', (info.get("code_ending") or "").lower())
@@ -303,9 +298,11 @@ def note_voucher_delivered(history, package):
     history.append({
         "role": "system",
         "content": (
-            f"SYSTEM NOTE: The backend has approved the customer's payment for {package} and delivered "
-            "their voucher in a separate message. Do NOT write voucher codes or approval messages "
-            "yourself. If asked for the code, tell them to scroll up to the approval message."
+            f"SYSTEM NOTE: The backend successfully processed the payment for {package} and delivered "
+            "the voucher to the customer. THAT TRANSACTION IS COMPLETELY CLOSED. "
+            "Do NOT refer to the old payment or old reference code again. "
+            "If the customer sends a new message (like a phone number), assume they want to buy a NEW voucher, "
+            "and ask them for their NEW proof of payment and package."
         )
     })
 
@@ -321,19 +318,17 @@ def parse_admin_alert(alert_text):
     code_ending = m.group("code").strip(" -\u2014:")
     code_alphanum = re.sub(r'[^A-Za-z0-9]', '', code_ending)
     
-    # Enforce exactly 7 characters extracted from the alert
-    if len(code_alphanum) >= 7:
-        code_ending = code_alphanum[-7:]
+    # Strictly reject at the parser level if the code is shorter than 7 characters
+    if len(code_alphanum) < 7:
+        return None
 
     return {
-        "code_ending": code_ending,
+        "code_ending": code_alphanum[-7:],
         "price": m.group("price").strip(" -\u2014:"),
         "phone": m.group("phone").strip(" -\u2014:"),
         "package": re.split(r'[\u2014-]', m.group("package"))[0].strip(),
     }
 
-# Require a minimum of 7 alphanumeric characters (6 trailing + 1 starting) 
-# instead of 4, ensuring it strictly matches approval codes, not random 4-digit numbers.
 TRANSACTION_REF_PATTERN = re.compile(
     r'(?:approval\s*code|transaction\s*id|trans(?:action)?\s*ref(?:erence)?|confirmation\s*code|ref(?:erence)?\s*(?:no\.?|number)?)\s*[:#]?\s*'
     r'([A-Za-z0-9][A-Za-z0-9.\-]{6,})',
@@ -352,7 +347,6 @@ def extract_code_ending_from_text(text):
     return None
 
 def find_target_customer(admin_text):
-    # Enforce 7 characters to avoid matching random 3 or 4-digit numbers
     digits_in_text = re.findall(r'[A-Za-z0-9]{7,}', admin_text)
     for cid, info in pending_approvals.items():
         ending = (info.get("code_ending") or "").strip()
@@ -499,16 +493,41 @@ def handle_customer_message(message):
         clean_reply, tampered = strip_fake_approval(clean_reply, known_text)
         if tampered:
             print(f"[GUARD] Blocked a fabricated approval/voucher in AI reply for {customer_key}.")
-        if not clean_reply and (alerts or tampered):
-            clean_reply = WAIT_MESSAGE if alerts else NEED_PROOF_MESSAGE
+
+        alerts_to_process = []
+        short_code_detected = False
+
+        if alerts:
+            for alert_text in alerts:
+                alert_text = alert_text.strip()
+                parsed = parse_admin_alert(alert_text)
+                
+                if parsed:
+                    alerts_to_process.append((alert_text, parsed))
+                else:
+                    # Check if the alert failed because the LLM tried to push a short <7 digit code
+                    m = re.search(r'CODE_ENDING:\s*([^|]+)', alert_text, re.IGNORECASE)
+                    if m:
+                        raw_c = re.sub(r'[^A-Za-z0-9]', '', m.group(1))
+                        if raw_c and len(raw_c) < 7:
+                            short_code_detected = True
+                            continue # Kill this alert
+                    
+                    # If it failed to parse for formatting reasons, fallback to unparsed
+                    alerts_to_process.append((alert_text, None))
+
+        # HARD BACKEND GUARD: Instantly intercept and override AI if it pushed a short code
+        if short_code_detected:
+            clean_reply = "⚠️ The transaction reference provided is too short. A valid approval code must be at least 7 characters long. Please send the FULL exact transaction reference."
+            alerts_to_process = []
+        elif not clean_reply and (alerts_to_process or tampered):
+            clean_reply = WAIT_MESSAGE if alerts_to_process else NEED_PROOF_MESSAGE
 
         duplicate_notice = False
 
-        if alerts:
+        if alerts_to_process:
             if admin_chat_id:
-                for alert in alerts:
-                    alert_text = alert.strip()
-                    parsed = parse_admin_alert(alert_text)
+                for alert_text, parsed in alerts_to_process:
                     label = customer_display.get(customer_key, str(customer_key))
 
                     if parsed:
@@ -581,8 +600,10 @@ def handle_customer_message(message):
         if clean_reply:
             clean_reply = ensure_closing_warning(clean_reply)
             history_entry = clean_reply
-            if alerts and not duplicate_notice:
-                history_entry += "".join(f"\n[ADMIN_ALERT]{a}" for a in alerts)
+            
+            # Keep AI context clean from fake memory loops
+            if alerts_to_process and not duplicate_notice:
+                history_entry += "".join(f"\n[ADMIN_ALERT]{a[0]}" for a in alerts_to_process)
             user_memory[customer_key].append({"role": "assistant", "content": history_entry})
             customer_bot.reply_to(message, clean_reply)
 
