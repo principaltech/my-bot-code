@@ -250,6 +250,8 @@ You are an automated customer care AI assistant for Splash Internet. You MUST fo
    - You must NEVER say or imply that a payment "has been approved", "verified", "confirmed" or "successful". You cannot know that.
 10. FRESH TRANSACTIONS:
    - If you see a SYSTEM NOTE telling you a new payment reference was submitted, treat it as a completely separate, brand-new transaction. Do NOT reuse a phone number or package mentioned earlier in this chat for that new reference. Ask the customer to (re)confirm both before producing any [ADMIN_ALERT].
+11. NEVER FABRICATE A "PAYMENT RECEIVED" REPLY:
+   - Only tell the customer their payment was received / to wait 30 seconds if THIS message actually contains a new, valid transaction reference. If the customer's latest message is something else (a package choice, "resend", a greeting, etc.) with no reference in it, do NOT repeat or imply an earlier payment confirmation from chat history - ask them for the actual proof of payment instead.
 """
 
 WAIT_MESSAGE = "Thank you, we have received your payment proof. Please wait about 30 seconds while we validate the payment."
@@ -273,6 +275,20 @@ FAKE_APPROVAL_RE = re.compile(
     re.IGNORECASE
 )
 SUSPICIOUS_TOKEN_RE = re.compile(r'\b(?=[A-Za-z0-9]*[A-Za-z])(?=[A-Za-z0-9]*\d)[A-Za-z0-9]{6,14}\b')
+
+# Detects the model fabricating a "we received your payment, please wait" style reply
+# purely from chat history, with no genuine new proof submitted this turn.
+FAKE_RECEIPT_RE = re.compile(
+    r'payment\s+of.{0,40}?(?:has\s+been|was)\s+received'
+    r'|your\s+payment.{0,60}?received.{0,60}?wait'
+    r'|please\s+wait.{0,40}?(?:30\s*seconds|validat\w*\s+the\s+payment)',
+    re.IGNORECASE | re.DOTALL
+)
+NO_GENUINE_PROOF_MESSAGE = (
+    "I don't see a new payment proof or transaction reference in your last message. "
+    "If you already paid, please resend the full EcoCash confirmation or transaction reference "
+    "so we can process it."
+)
 
 def strip_fake_approval(reply, known_text=""):
     if not reply:
@@ -632,8 +648,27 @@ def handle_customer_message(message):
         elif not clean_reply and (alerts_to_process or tampered):
             clean_reply = WAIT_MESSAGE if alerts_to_process else NEED_PROOF_MESSAGE
 
-        # Python Templating Enforcement: If AI mentions approval code ending, strictly enforce Python's exact verified value
-        if customer_key in customer_last_code and ("code ending" in clean_reply.lower() or "approval code" in clean_reply.lower()):
+        # GUARD + Templating Enforcement, combined and made STRUCTURAL rather than wording-based.
+        #
+        # A real "payment received" confirmation can only be genuine if THIS turn actually
+        # extracted a new reference from the customer's own message, or produced a real admin
+        # alert. Anything else claiming a code/approval-code reference is, by construction, the
+        # model recalling an OLD exchange from chat history - regardless of how it phrases it
+        # ("please wait 30 seconds", "please hold on", "we are confirming", etc). We do not try
+        # to pattern-match every possible phrasing the model might use; instead we key off the
+        # one thing that must never appear without genuine backing: a mention of a code/approval
+        # reference at all.
+        genuine_receipt_this_turn = bool(extracted_ref) or bool(alerts_to_process)
+        mentions_code_reference = (
+            "code ending" in clean_reply.lower() or "approval code" in clean_reply.lower()
+        )
+
+        if clean_reply and mentions_code_reference and not genuine_receipt_this_turn:
+            print(f"[GUARD] Blocked a reply referencing a code/approval reference for {customer_key} "
+                  "with no genuine proof extracted and no admin alert generated this turn.")
+            clean_reply = NO_GENUINE_PROOF_MESSAGE
+        elif clean_reply and mentions_code_reference and customer_key in customer_last_code:
+            # Genuine case: enforce Python's exact verified value rather than whatever the model wrote.
             true_ending = customer_last_code[customer_key]
             clean_reply = re.sub(
                 r'(Approval Code ending\s*\**\s*)[A-Za-z0-9]+(\s*\**)',
@@ -641,6 +676,13 @@ def handle_customer_message(message):
                 clean_reply,
                 flags=re.IGNORECASE
             )
+
+        # Secondary, best-effort catch: a fabricated "payment received / please wait" reply that
+        # doesn't even mention "code ending" but still falsely implies proof was just received.
+        if clean_reply and not genuine_receipt_this_turn and FAKE_RECEIPT_RE.search(clean_reply):
+            print(f"[GUARD] Blocked a fabricated 'payment received' reply for {customer_key} "
+                  "(no new proof extracted and no admin alert generated this turn).")
+            clean_reply = NO_GENUINE_PROOF_MESSAGE
 
         duplicate_notice = False
 
