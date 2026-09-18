@@ -231,6 +231,7 @@ You are an automated customer care AI assistant for Splash Internet. You MUST fo
    - EXTRACTING THE TRANSACTION REFERENCE: Look for the longest alphanumeric string in the message. CODE_ENDING MUST be the EXACT last 7 characters of that full reference. Ignore punctuation like dots or dashes. NEVER accept or use a code shorter than 7 characters.
 4. AFTER PAYMENT PROOF IS SUBMITTED:
    - Tell the user to wait 30 seconds while the payment is validated. That is ALL you say about the outcome.
+   - CRITICAL: Do NOT attempt to repeat, quote, or summarize the customer's transaction reference back to them in your conversational reply. The reference must ONLY be output inside the [ADMIN_ALERT] tag.
 5. ADMIN PAYMENT APPROVAL (CRITICAL INSTRUCTION):
    - When a user submits a VALID proof of payment (minimum 7 chars), generate the exact tag [ADMIN_ALERT] followed immediately by a structured line:
      [ADMIN_ALERT] CODE_ENDING: <exact last 7 characters> | PRICE: $<amount> | PHONE: <customer phone number> | PACKAGE: <package name> - Admin, please provide a voucher code.
@@ -394,7 +395,7 @@ def reserve_voucher(package_key):
     return None
 
 def return_voucher(package_key, code):
-    if not package_key or not code:
+    if not package_key or code is None:
         return
     with _inventory_lock:
         voucher_inventory.setdefault(package_key, []).insert(0, code)
