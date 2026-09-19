@@ -739,15 +739,18 @@ def reconcile_returning_customer(message, chat_customer_key, raw_text):
 
 def maybe_bump_admin_for_pending(customer_key, text, label):
     """
-    Call this for a message that (a) reconciled to an existing key, (b) carries
-    no fresh transaction reference this turn, and (c) looks like a status
-    follow-up. If the transaction is still awaiting an admin decision and it's
-    been a while since we last alerted, send a low-key reminder - never a
-    second full "PAYMENT APPROVAL" alert, and never anything implying approval.
+    Call this for any message that reconciled to an existing, already-alerted,
+    unresolved transaction and carries no new information (no ref, no phone,
+    no package). We deliberately do NOT require specific wording here -
+    "resend", "resubmission", "re-verify", "check again", or literally
+    anything else the customer types in that state means the same thing:
+    they're still waiting and the admin needs a nudge. If it's been a while
+    since we last alerted, send a low-key reminder - never a second full
+    "PAYMENT APPROVAL" alert, and never anything implying approval.
     Returns True if it sent a reminder.
     """
     info = pending_approvals.get(customer_key)
-    if not info or not info.get("alert_sent") or not FOLLOWUP_STATUS_RE.search(text or ""):
+    if not info or not info.get("alert_sent"):
         return False
 
     now = time.time()
