@@ -203,7 +203,7 @@ admin_awaiting = {}
 _admin_state_lock = Lock()
 
 PACKAGES = {
-    "24 HOURS LITE": {"price": "$1.00", "data": "UNLIMITED"},
+    "$1:UNL:24HRS": {"price": "$1.00", "data": "UNLIMITED"},
     "2 DAYS": {"price": "$0.50", "data": "5GB"},
     "7 DAYS": {"price": "$1.00", "data": "12GB"},
     "14 DAYS PRO": {"price": "$5.00", "data": "UNLIMITED"},
@@ -223,7 +223,7 @@ You are an automated customer care AI assistant for Splash Internet. You MUST fo
 
 1. LANGUAGE: Support ONLY Shona or English. Match the user's language.
 2. PRICING & PACKAGES:
-   - 24 HOURS LITE = USD $1.00 = UNLIMITED
+   - $1:UNL:24HRS = USD $1.00 = UNLIMITED
    - 2 DAYS = USD $0.50 = 5GB
    - 7 DAYS = USD $1.00 = 12GB
    - 14 DAYS PRO = USD $5.00 = UNLIMITED
@@ -458,7 +458,7 @@ def normalize_package_compact(text):
 #    requires the space in "7 DAYS", which "7days" without a space never satisfies)
 #  - informal shorthand like "7d", "24h", "2 days"
 PACKAGE_DURATION_MAP = {
-    ("24", "h"): "24 HOURS LITE",
+    ("24", "h"): "$1:UNL:24HRS",
     ("2", "d"): "2 DAYS",
     ("7", "d"): "7 DAYS",
     ("14", "d"): "14 DAYS PRO",
