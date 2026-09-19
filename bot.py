@@ -152,6 +152,7 @@ def save_state():
         "voucher_inventory": voucher_inventory,
         "used_payment_refs": sorted(used_payment_refs),
         "admin_chat_id": admin_chat_id,
+        "intergram_tag_to_key": intergram_tag_to_key,
     }
     try:
         with _db_lock:
@@ -177,6 +178,7 @@ def load_state():
         used_payment_refs.update(snapshot.get("used_payment_refs", []))
         for pkg, codes in snapshot.get("voucher_inventory", {}).items():
             voucher_inventory[pkg] = codes
+        intergram_tag_to_key.update(snapshot.get("intergram_tag_to_key", {}))
         admin_chat_id = snapshot.get("admin_chat_id")
     except Exception as e:
         print(f"[DB] Failed to load state: {e}")
@@ -198,6 +200,13 @@ def display_name_for(message):
 
 pending_approvals = {}
 used_payment_refs = set()
+
+# Maps Intergram's stable per-visitor tag (the short code Intergram prefixes onto
+# every forwarded message, e.g. "y6ysyx: Hi") to whichever customer_key currently
+# holds that visitor's record. Unlike chat_id, this tag does NOT change when the
+# widget session resets, so it's the right thing to key returning-customer
+# identity on.
+intergram_tag_to_key = {}
 
 admin_awaiting = {}
 _admin_state_lock = Lock()
@@ -604,9 +613,13 @@ def cancel_pending_for_customer(customer_key, reason="left the chat"):
 # Intergram gives each browser/widget session a NEW Telegram chat_id, so
 # make_customer_key() (chat_id:user_id) treats a returning customer as a total
 # stranger even though their earlier payment proof is still sitting, unresolved,
-# in pending_approvals under their OLD key. This reattaches them using their
-# phone number (the one thing that stays stable across sessions) instead of
-# silently dropping them or firing a brand-new admin alert for the same payment.
+# in pending_approvals under their OLD key.
+#
+# The reliable fix: Intergram prefixes every forwarded message with a short,
+# STABLE per-visitor tag, e.g. "y6ysyx: Hi" - that tag does NOT change when the
+# chat_id does, so it's the correct identity key, not chat_id and not phone
+# number. Phone-number matching (and the single-pending fallback) is kept as a
+# secondary safety net for the rare message that doesn't carry a tag.
 
 REBUMP_COOLDOWN_SECONDS = 15  # just enough to absorb accidental double-sends/webhook retries,
                                # not to make an impatient customer wait for a re-alert
@@ -619,6 +632,26 @@ FOLLOWUP_STATUS_RE = re.compile(
     re.IGNORECASE
 )
 
+# ASSUMPTION based on the two examples you gave ("cdgrmv:", "y6ysyx:"): the tag
+# is exactly 6 lowercase letters/digits. If your Intergram config uses a
+# different length or includes uppercase, adjust {6} and the character class
+# below to match - check a few real forwarded messages to confirm the format.
+INTERGRAM_TAG_RE = re.compile(r'^([a-z0-9]{6}):\s?(.*)$', re.IGNORECASE | re.DOTALL)
+
+def extract_intergram_tag(raw_text):
+    """
+    Splits an Intergram-forwarded message into (tag, message_without_tag).
+    Returns (None, raw_text) if no tag is present (e.g. a message typed
+    directly by an admin, or an unrelated format) so callers can fall back
+    to the phone-number heuristics safely.
+    """
+    if not raw_text:
+        return None, raw_text
+    m = INTERGRAM_TAG_RE.match(raw_text.strip())
+    if not m:
+        return None, raw_text
+    return m.group(1), m.group(2).strip()
+
 def find_pending_by_phone(phone):
     if not phone:
         return None
@@ -627,35 +660,18 @@ def find_pending_by_phone(phone):
             return key
     return None
 
-def reconcile_returning_customer(message, customer_key, text):
-    """
-    Called BEFORE we touch customer_chat_id/user_memory for this message.
-    If this chat/user combo is new to us but the message carries a phone
-    number matching an OPEN pending approval under a different (stale) key,
-    re-point that existing record at the customer's current chat instead of
-    starting a fresh, disconnected conversation.
+def _repoint_customer_routing(message, key):
+    """Re-point delivery coordinates (chat id, reply-to message id, display
+    name) at the customer's CURRENT session, while keeping the same record
+    key - so the existing pending_approvals entry (and its history with the
+    admin) stays intact instead of us creating a second, duplicate request
+    for the same payment."""
+    customer_chat_id[key] = message.chat.id
+    user_last_message_id[key] = message.message_id
+    customer_display[key] = display_name_for(message)
 
-    Returns the key that should be treated as canonical for this message
-    (either the original customer_key, or the reattached old_key).
-    """
-    if customer_key in pending_approvals or customer_key in user_memory:
-        return customer_key  # already tracked under this exact chat
-
-    phone = extract_phone_from_text(text)
-    old_key = find_pending_by_phone(phone) if phone else None
-    if not old_key or old_key == customer_key:
-        return customer_key
-
-    # Re-point delivery coordinates at the customer's CURRENT session, but
-    # keep the OLD key so the existing pending_approvals record (and its
-    # history with the admin) stays intact - this avoids creating a second,
-    # duplicate request for the same payment.
-    customer_chat_id[old_key] = message.chat.id
-    user_last_message_id[old_key] = message.message_id
-    customer_display[old_key] = display_name_for(message)
-
-    if old_key in user_memory:
-        user_memory[old_key].append({
+    if key in user_memory:
+        user_memory[key].append({
             "role": "system",
             "content": (
                 "SYSTEM NOTE: The customer re-opened the chat (their widget session "
@@ -665,10 +681,60 @@ def reconcile_returning_customer(message, customer_key, text):
                 "this as a new purchase."
             )
         })
+    print(f"[RECONCILE] Reattached returning customer -> existing record {key}")
 
-    print(f"[RECONCILE] Reattached returning customer -> existing record {old_key}")
+def reconcile_returning_customer(message, chat_customer_key, raw_text):
+    """
+    Called BEFORE we touch customer_chat_id/user_memory for this message.
+    Works out which customer_key should be treated as canonical for this
+    message, and strips any Intergram tag off the text so downstream regexes
+    (phone/reference/package extraction) see clean customer text.
+
+    Priority, strongest signal first:
+      1. Intergram's stable per-visitor tag - trusted on its own, even with
+         zero other info in the message (fixes "hi" / "resend" / "still
+         waiting" with nothing else in it).
+      2. A phone number in the message matching an open pending approval.
+      3. Exactly ONE open, already-alerted transaction system-wide and this
+         message reads like a status follow-up (last-resort, single-customer
+         only - never guessed when more than one customer is waiting, since a
+         wrong guess would leak/misroute someone else's transaction).
+
+    Returns (canonical_key, cleaned_text).
+    """
+    tag, cleaned_text = extract_intergram_tag(raw_text)
+
+    if tag:
+        known_key = intergram_tag_to_key.get(tag)
+        if known_key and known_key != chat_customer_key and (
+            known_key in pending_approvals or known_key in user_memory
+        ):
+            _repoint_customer_routing(message, known_key)
+            save_state()
+            return known_key, cleaned_text
+        # First time we've seen this tag, or it already matches this chat -
+        # remember the mapping for next time.
+        intergram_tag_to_key[tag] = chat_customer_key
+        return chat_customer_key, cleaned_text
+
+    # No tag on this message - fall back to the older heuristics.
+    if chat_customer_key in pending_approvals or chat_customer_key in user_memory:
+        return chat_customer_key, cleaned_text
+
+    phone = extract_phone_from_text(cleaned_text)
+    old_key = find_pending_by_phone(phone) if phone else None
+
+    if not old_key and len(pending_approvals) == 1 and FOLLOWUP_STATUS_RE.search(cleaned_text or ""):
+        only_key, only_info = next(iter(pending_approvals.items()))
+        if only_info.get("alert_sent"):
+            old_key = only_key
+
+    if not old_key or old_key == chat_customer_key:
+        return chat_customer_key, cleaned_text
+
+    _repoint_customer_routing(message, old_key)
     save_state()
-    return old_key
+    return old_key, cleaned_text
 
 
 def maybe_bump_admin_for_pending(customer_key, text, label):
@@ -722,11 +788,13 @@ def handle_customer_message(message):
         return
 
     customer_key = make_customer_key(message)
-    text = message.text.strip()
+    raw_text = message.text.strip()
 
     # Reattach returning customers whose Intergram chat_id changed since their
-    # last message, using phone-number matching against open pending approvals.
-    customer_key = reconcile_returning_customer(message, customer_key, text)
+    # last message - primarily via Intergram's own stable per-visitor tag,
+    # with phone-number matching as a fallback. Also strips the tag off the
+    # text so extraction regexes below see clean customer text.
+    customer_key, text = reconcile_returning_customer(message, customer_key, raw_text)
 
     user_last_message_id[customer_key] = message.message_id
     customer_chat_id[customer_key] = message.chat.id
