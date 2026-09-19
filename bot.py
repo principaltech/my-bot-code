@@ -459,10 +459,9 @@ def delete_voucher(code, package_key=None):
 
 def deduplicate_inventory():
     """
-    Remove duplicate voucher codes from stock, keeping the first occurrence
-    of each code (checked across all packages, since the same code should
-    never sit under two different packages either). Returns a dict of
-    {package_key: [removed_codes]} for packages that had duplicates removed.
+    Remove duplicate voucher codes from stock (keeping the first occurrence
+    of each code across all packages). Returns {package_key: [removed_codes]}
+    for packages that had at least one duplicate removed.
     """
     removed_by_package = {}
     with _inventory_lock:
@@ -487,55 +486,6 @@ ADD_CODE_PATTERN = re.compile(
     r'^\s*add\s+code\s+(?P<code>\S+)\s+for\s+(?P<package>.+?)\s*$',
     re.IGNORECASE
 )
-
-# Bulk receipt-style add, e.g.:
-#   CODE:
-#   sbb63zg
-#   $1:UNL:24HRS
-#   Keep this receipt safe
-# Repeated any number of times in one message. We only need the CODE line
-# and the "$price:data:duration" line - the "Keep this receipt safe" line
-# (or any other trailing text) is ignored.
-BULK_CODE_BLOCK_PATTERN = re.compile(
-    r'CODE:\s*\r?\n\s*(?P<code>\S+)\s*\r?\n\s*\$\s*(?P<price>[\d.]+)\s*:\s*(?P<data>[A-Za-z0-9]+)\s*:\s*(?P<duration>[A-Za-z0-9]+)',
-    re.IGNORECASE
-)
-
-
-def match_shorthand_package(price_str, data_str, duration_str):
-    """
-    Map a shorthand "$price:data:duration" triple (e.g. "$1:UNL:24HRS") to
-    one of the known PACKAGES keys, using price + data as the primary match
-    and the duration text (e.g. "24HRS", "7DAYS") only as a tie-breaker if
-    more than one package shares the same price and data.
-    """
-    try:
-        price_val = float(price_str)
-    except (TypeError, ValueError):
-        return None
-    price_fmt = f"${price_val:.2f}"
-
-    data_norm = data_str.strip().upper()
-    if data_norm in ("UNL", "UNLIMITED"):
-        data_norm = "UNLIMITED"
-
-    candidates = [
-        pkg for pkg, info in PACKAGES.items()
-        if info["price"] == price_fmt and info["data"].upper() == data_norm
-    ]
-
-    if len(candidates) == 1:
-        return candidates[0]
-
-    if len(candidates) > 1:
-        dur_match = re.match(r'(\d+)', duration_str.strip())
-        dur_num = dur_match.group(1) if dur_match else None
-        if dur_num:
-            refined = [pkg for pkg in candidates if dur_num in pkg]
-            if len(refined) == 1:
-                return refined[0]
-
-    return None
 
 DELETE_CODE_PATTERN = re.compile(
     r'^\s*delete\s+code\s+(?P<code>\S+)(?:\s+from\s+(?P<package>.+?))?\s*$',
@@ -803,78 +753,23 @@ def handle_admin_message(message):
         save_state()
         return
 
-    bulk_matches = list(BULK_CODE_BLOCK_PATTERN.finditer(text))
-    if bulk_matches:
-        added, failed, duplicates = [], [], []
-        for m in bulk_matches:
-            code = m.group("code").strip()
-            pkg_key = match_shorthand_package(m.group("price"), m.group("data"), m.group("duration"))
-            if not pkg_key:
-                failed.append(
-                    f"{code} (unrecognized package for ${m.group('price')}:{m.group('data')}:{m.group('duration')})"
-                )
-                continue
-
-            with _inventory_lock:
-                already_exists = any(
-                    code.lower() == c.lower()
-                    for codes in voucher_inventory.values()
-                    for c in codes
-                )
-                if already_exists:
-                    duplicates.append(f"{code} (already in stock)")
-                    continue
-                voucher_inventory.setdefault(pkg_key, []).append(code)
-            added.append(f"{code} → {pkg_key} ({PACKAGES[pkg_key]['price']}, {PACKAGES[pkg_key]['data']})")
-
-        reply_parts = []
-        if added:
-            reply_parts.append(f"✅ Added {len(added)} code(s) to stock:\n" + "\n".join(added))
-        if duplicates:
-            reply_parts.append(
-                "⚠️ Skipped (duplicate - already in stock):\n" + "\n".join(duplicates)
-            )
-        if failed:
-            reply_parts.append(
-                "⚠️ Could not match a package for:\n" + "\n".join(failed) +
-                "\n\nKnown packages: " + ", ".join(
-                    f"{pkg} ({info['price']}, {info['data']})" for pkg, info in PACKAGES.items()
-                )
-            )
-        admin_bot.reply_to(message, "\n\n".join(reply_parts))
-        save_state()
-        return
-
     add_matches = [m for m in (ADD_CODE_PATTERN.match(line) for line in text.splitlines()) if m]
     if add_matches:
-        added, failed, duplicates = [], [], []
+        added, failed = [], []
         for m in add_matches:
             code = m.group("code").strip()
             pkg_input = m.group("package").strip()
             pkg_key = normalize_package(pkg_input)
-            if not pkg_key:
+            if pkg_key:
+                with _inventory_lock:
+                    voucher_inventory.setdefault(pkg_key, []).append(code)
+                added.append(f"{code} → {pkg_key} ({PACKAGES[pkg_key]['price']}, {PACKAGES[pkg_key]['data']})")
+            else:
                 failed.append(f"{code} (unrecognized package '{pkg_input}')")
-                continue
-
-            with _inventory_lock:
-                already_exists = any(
-                    code.lower() == c.lower()
-                    for codes in voucher_inventory.values()
-                    for c in codes
-                )
-                if already_exists:
-                    duplicates.append(f"{code} (already in stock)")
-                    continue
-                voucher_inventory.setdefault(pkg_key, []).append(code)
-            added.append(f"{code} → {pkg_key} ({PACKAGES[pkg_key]['price']}, {PACKAGES[pkg_key]['data']})")
 
         reply_parts = []
         if added:
             reply_parts.append("✅ Added to stock:\n" + "\n".join(added))
-        if duplicates:
-            reply_parts.append(
-                "⚠️ Skipped (duplicate - already in stock):\n" + "\n".join(duplicates)
-            )
         if failed:
             reply_parts.append(
                 "⚠️ Could not match package for:\n" + "\n".join(failed) +
