@@ -562,6 +562,107 @@ def cancel_pending_for_customer(customer_key, reason="left the chat"):
     return True
 
 # ==========================================
+# RECONCILIATION: reconnect returning customers across Intergram chat-id changes
+# ==========================================
+#
+# Intergram gives each browser/widget session a NEW Telegram chat_id, so
+# make_customer_key() (chat_id:user_id) treats a returning customer as a total
+# stranger even though their earlier payment proof is still sitting, unresolved,
+# in pending_approvals under their OLD key. This reattaches them using their
+# phone number (the one thing that stays stable across sessions) instead of
+# silently dropping them or firing a brand-new admin alert for the same payment.
+
+REBUMP_COOLDOWN_SECONDS = 10 * 60  # don't nudge admin more than once per 10 min
+
+FOLLOWUP_STATUS_RE = re.compile(
+    r'\b(where.?s?\s+my\s+code|any\s+update|did\s+you\s+(get|receive)|status|'
+    r'still\s+waiting|already\s+paid|already\s+sent|didn.?t\s+get|'
+    r'haven.?t\s+received|hello|hi|helo)\b',
+    re.IGNORECASE
+)
+
+def find_pending_by_phone(phone):
+    if not phone:
+        return None
+    for key, info in pending_approvals.items():
+        if info.get("phone") == phone:
+            return key
+    return None
+
+def reconcile_returning_customer(message, customer_key, text):
+    """
+    Called BEFORE we touch customer_chat_id/user_memory for this message.
+    If this chat/user combo is new to us but the message carries a phone
+    number matching an OPEN pending approval under a different (stale) key,
+    re-point that existing record at the customer's current chat instead of
+    starting a fresh, disconnected conversation.
+
+    Returns the key that should be treated as canonical for this message
+    (either the original customer_key, or the reattached old_key).
+    """
+    if customer_key in pending_approvals or customer_key in user_memory:
+        return customer_key  # already tracked under this exact chat
+
+    phone = extract_phone_from_text(text)
+    old_key = find_pending_by_phone(phone) if phone else None
+    if not old_key or old_key == customer_key:
+        return customer_key
+
+    # Re-point delivery coordinates at the customer's CURRENT session, but
+    # keep the OLD key so the existing pending_approvals record (and its
+    # history with the admin) stays intact - this avoids creating a second,
+    # duplicate request for the same payment.
+    customer_chat_id[old_key] = message.chat.id
+    user_last_message_id[old_key] = message.message_id
+    customer_display[old_key] = display_name_for(message)
+
+    if old_key in user_memory:
+        user_memory[old_key].append({
+            "role": "system",
+            "content": (
+                "SYSTEM NOTE: The customer re-opened the chat (their widget session "
+                "restarted and got a new chat id, which is normal for this platform). "
+                "This is the SAME person and the SAME still-open transaction as before "
+                "in this history - do not ask them to resubmit payment proof or treat "
+                "this as a new purchase."
+            )
+        })
+
+    print(f"[RECONCILE] Reattached returning customer -> existing record {old_key}")
+    save_state()
+    return old_key
+
+
+def maybe_bump_admin_for_pending(customer_key, text, label):
+    """
+    Call this for a message that (a) reconciled to an existing key, (b) carries
+    no fresh transaction reference this turn, and (c) looks like a status
+    follow-up. If the transaction is still awaiting an admin decision and it's
+    been a while since we last alerted, send a low-key reminder - never a
+    second full "PAYMENT APPROVAL" alert, and never anything implying approval.
+    Returns True if it sent a reminder.
+    """
+    info = pending_approvals.get(customer_key)
+    if not info or not info.get("alert_sent") or not FOLLOWUP_STATUS_RE.search(text or ""):
+        return False
+
+    now = time.time()
+    last = info.get("last_alert_time", 0)
+    if now - last < REBUMP_COOLDOWN_SECONDS:
+        return False  # already nudged recently, don't spam
+
+    if admin_chat_id:
+        admin_bot.send_message(
+            admin_chat_id,
+            f"⏰ Reminder: {label} is still waiting on a decision "
+            f"(code ending {info.get('code_ending')}, {info.get('package')}, "
+            f"phone {info.get('phone')}). Reply YES/NO, or a code, to resolve."
+        )
+    info["last_alert_time"] = now
+    save_state()
+    return True
+
+# ==========================================
 # BOT 1: CUSTOMER BOT HANDLER
 # ==========================================
 @customer_bot.message_handler(func=lambda message: True)
@@ -575,6 +676,10 @@ def handle_customer_message(message):
     customer_key = make_customer_key(message)
     text = message.text.strip()
 
+    # Reattach returning customers whose Intergram chat_id changed since their
+    # last message, using phone-number matching against open pending approvals.
+    customer_key = reconcile_returning_customer(message, customer_key, text)
+
     user_last_message_id[customer_key] = message.message_id
     customer_chat_id[customer_key] = message.chat.id
     customer_display[customer_key] = display_name_for(message)
@@ -587,6 +692,24 @@ def handle_customer_message(message):
     # Make sure conversation memory exists before we possibly inject a system note below.
     if customer_key not in user_memory:
         user_memory[customer_key] = [{"role": "system", "content": system_rules}]
+
+    # If this is just a status follow-up on an already-open, already-alerted
+    # transaction (no fresh reference this turn), answer from real state and
+    # skip the LLM entirely - guarantees no fabricated status, and only bumps
+    # the admin at most once per cooldown window instead of on every message.
+    if not extracted_ref:
+        label = customer_display.get(customer_key, customer_key)
+        pending_info = pending_approvals.get(customer_key)
+        if pending_info and pending_info.get("alert_sent") and not pending_info.get("proposed_code"):
+            maybe_bump_admin_for_pending(customer_key, text, label)
+            reply_text = ensure_closing_warning(
+                "Your payment is still with our team for verification — we haven't forgotten you. "
+                "You'll get your voucher code the moment it's approved."
+            )
+            user_memory[customer_key].append({"role": "assistant", "content": reply_text})
+            customer_bot.reply_to(message, reply_text)
+            save_state()
+            return
 
     if extracted_ref:
         customer_last_code[customer_key] = extracted_ref
@@ -798,6 +921,7 @@ def handle_customer_message(message):
                         pending_approvals[customer_key]["alert_sent"] = True
                         pending_approvals[customer_key]["phone_confirmed"] = True
                         pending_approvals[customer_key]["package_confirmed"] = True
+                        pending_approvals[customer_key]["last_alert_time"] = time.time()
 
                         if reserved_code:
                             admin_msg = (
@@ -826,7 +950,8 @@ def handle_customer_message(message):
                         pending_approvals[customer_key] = {
                             "code_ending": extract_code_ending_from_text(text) or "",
                             "price": "", "phone": "", "package": "",
-                            "package_key": None, "proposed_code": None, "alert_sent": True
+                            "package_key": None, "proposed_code": None, "alert_sent": True,
+                            "last_alert_time": time.time(),
                         }
                         admin_msg = f"🔔 ADMIN ALERT (Customer: {label}):\n{alert_text}"
                     admin_bot.send_message(admin_chat_id, admin_msg)
@@ -1234,7 +1359,7 @@ def run_admin_bot():
 
 if __name__ == "__main__":
     import sys
-    print("[VERSION] splash_bot.py — build with lenient package matching + open-pending guard fix", flush=True)
+    print("[VERSION] splash_bot.py — build with lenient package matching + open-pending guard fix + Intergram reconnect", flush=True)
     load_state()
     print(f"[Groq] Loaded {len(groq_clients)} API key(s) for rotation/fallback.", flush=True)
     Thread(target=run_customer_bot).start()
