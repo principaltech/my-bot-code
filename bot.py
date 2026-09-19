@@ -153,6 +153,7 @@ def save_state():
         "used_payment_refs": sorted(used_payment_refs),
         "admin_chat_id": admin_chat_id,
         "intergram_tag_to_key": intergram_tag_to_key,
+        "registered_proofs": registered_proofs,
     }
     try:
         with _db_lock:
@@ -179,6 +180,7 @@ def load_state():
         for pkg, codes in snapshot.get("voucher_inventory", {}).items():
             voucher_inventory[pkg] = codes
         intergram_tag_to_key.update(snapshot.get("intergram_tag_to_key", {}))
+        registered_proofs.update(snapshot.get("registered_proofs", {}))
         admin_chat_id = snapshot.get("admin_chat_id")
     except Exception as e:
         print(f"[DB] Failed to load state: {e}")
@@ -334,6 +336,9 @@ def mark_payment_used(info):
     fp = payment_fingerprint(info)
     if fp:
         used_payment_refs.add(fp)
+        # Once a payment is redeemed, drop any admin-registered proof for it too.
+        with _proofs_lock:
+            registered_proofs.pop(fp, None)
 
 def note_voucher_delivered(history, package):
     history.append({
@@ -606,6 +611,267 @@ def cancel_pending_for_customer(customer_key, reason="left the chat"):
     save_state()
     return True
 
+
+# ==========================================================================
+# PRE-REGISTERED PROOF OF PAYMENT  ->  AUTO-APPROVAL
+#
+# How it works:
+#   1. You paste the real EcoCash confirmation into the ADMIN bot:
+#         Transfer Confirmation: USD 1.00 from MICHAEL KUSUBA.
+#         Approval Code: PP260919.2324.T3345746
+#         New balance: USD 15.63.
+#      The bot stores: amount (1.00), full reference, and its last 7 chars.
+#   2. When a customer sends proof, the bot auto-approves ONLY if
+#         - last 7 chars of the approval code match a registered proof, AND
+#         - the amount they sent equals the registered amount, AND
+#         - (if they sent the full reference) the full reference matches, AND
+#         - the package's price equals the paid amount, AND
+#         - a stocked voucher exists for that package.
+#      Anything else falls through to the normal AI + admin YES/NO flow.
+#   3. After the voucher is delivered, the registered proof is DELETED and
+#      the reference is burned in used_payment_refs (replay protection).
+# ==========================================================================
+
+AUTO_APPROVE_ENABLED = os.environ.get("AUTO_APPROVE_ENABLED", "1") != "0"
+# Set AUTO_APPROVE_REQUIRE_PHONE=1 if you also want the customer's phone number
+# before auto-sending (by default price + reference + package are enough).
+AUTO_APPROVE_REQUIRE_PHONE = os.environ.get("AUTO_APPROVE_REQUIRE_PHONE", "0") == "1"
+
+# fingerprint (last 7 alphanumerics, lowercase) -> {"amount", "full_ref", "sender", "registered_at"}
+registered_proofs = {}
+_proofs_lock = Lock()
+
+PROOF_MARKER_RE = re.compile(r'approval\s*code|transfer\s*confirmation', re.IGNORECASE)
+
+
+def normalize_ref(text):
+    return re.sub(r'[^a-z0-9]', '', (text or '').lower())
+
+
+def proof_fingerprint(ref):
+    cleaned = normalize_ref(ref)
+    return cleaned[-7:] if len(cleaned) >= 7 else None
+
+
+def extract_full_reference_from_text(text):
+    """Full approval code with punctuation stripped, e.g. 'PP2609192324T3345746'."""
+    if not text:
+        return None
+    m = TRANSACTION_REF_PATTERN.search(text)
+    if not m:
+        return None
+    raw = re.sub(r'[^A-Za-z0-9]', '', m.group(1))
+    return raw if len(raw) >= 7 else None
+
+
+def extract_payment_amount(text):
+    """The transferred amount as '1.00' - skips 'New balance: USD 15.63' style figures."""
+    if not text:
+        return None
+    for m in AMOUNT_RE.finditer(text):
+        start, end = m.span()
+        window = text[max(0, start - 20):min(len(text), end + 20)]
+        if BALANCE_CONTEXT_RE.search(window):
+            continue
+        try:
+            return f"{float(m.group(1)):.2f}"
+        except ValueError:
+            return None
+    return None
+
+
+def parse_proof_blocks(text):
+    """Parses one OR several pasted confirmations (split on 'Transfer Confirmation')."""
+    proofs = []
+    for block in re.split(r'(?=Transfer\s+Confirmation)', text, flags=re.IGNORECASE):
+        block = block.strip()
+        if not block:
+            continue
+        full_ref = extract_full_reference_from_text(block)
+        amount = extract_payment_amount(block)
+        if not full_ref or not amount:
+            continue
+        sender_m = re.search(r'\bfrom\s+([^\n.]+)', block, re.IGNORECASE)
+        proofs.append({
+            "amount": amount,
+            "full_ref": full_ref,
+            "sender": sender_m.group(1).strip() if sender_m else "",
+            "registered_at": time.time(),
+        })
+    return proofs
+
+
+def try_auto_approve(customer_key):
+    """Returns True only if a voucher was delivered. Returns False (touching nothing)
+    whenever anything doesn't line up, so the normal manual flow takes over."""
+    if not AUTO_APPROVE_ENABLED:
+        return False
+    info = pending_approvals.get(customer_key)
+    if not info:
+        return False
+
+    fp = proof_fingerprint(info.get("code_ending"))
+    if not fp or fp in used_payment_refs:
+        return False
+    with _proofs_lock:
+        proof = registered_proofs.get(fp)
+    if not proof:
+        return False  # admin never registered this payment -> manual flow
+
+    # --- verification: price ---------------------------------------------
+    if info.get("claimed_amount") != proof["amount"]:
+        print(f"[AUTO] {customer_key}: amount mismatch (claimed {info.get('claimed_amount')} vs "
+              f"registered {proof['amount']}) - manual flow.")
+        return False
+
+    # --- verification: full reference, when the customer supplied it -------
+    claimed_ref = normalize_ref(info.get("claimed_ref"))
+    reg_ref = normalize_ref(proof.get("full_ref"))
+    if len(claimed_ref) > 7 and len(reg_ref) > 7 and claimed_ref != reg_ref:
+        print(f"[AUTO] {customer_key}: full reference mismatch - manual flow.")
+        return False
+
+    if AUTO_APPROVE_REQUIRE_PHONE and not info.get("phone"):
+        return False
+
+    # --- verification: package must exist and cost exactly what was paid ---
+    pkg_key = info.get("package_key")
+    if not pkg_key:
+        matches = PRICE_TO_PACKAGES.get(proof["amount"], [])
+        pkg_key = matches[0] if len(matches) == 1 else None  # ambiguous -> ask customer
+    if not pkg_key or pkg_key not in PACKAGES:
+        return False
+    try:
+        pkg_price = f"{float(PACKAGES[pkg_key]['price'].replace('$', '')):.2f}"
+    except ValueError:
+        return False
+    if pkg_price != proof["amount"]:
+        print(f"[AUTO] {customer_key}: paid {proof['amount']} but chose {pkg_key} ({pkg_price}) - manual flow.")
+        return False
+
+    chat_id = customer_chat_id.get(customer_key)
+    if chat_id is None:
+        return False
+
+    # --- get a voucher (reuse one already reserved for this customer) -----
+    reserved_here = not info.get("proposed_code")
+    code = info.get("proposed_code") or reserve_voucher(pkg_key)
+    if not code:
+        return False  # out of stock -> normal flow asks admin for a code
+
+    # --- atomically claim the proof so two customers can't both redeem it -
+    with _proofs_lock:
+        claimed = registered_proofs.pop(fp, None)
+    if not claimed:
+        if reserved_here:
+            return_voucher(pkg_key, code)
+        return False
+
+    voucher_message = (
+        f"✅ Your payment has been approved!\n\n"
+        f"Package: {pkg_key}\n"
+        f"Voucher code: {code}\n\n"
+        + CLOSING_WARNING
+    )
+    try:
+        reply_id = user_last_message_id.get(customer_key)
+        if reply_id:
+            customer_bot.send_message(chat_id, voucher_message, reply_to_message_id=reply_id)
+        else:
+            customer_bot.send_message(chat_id, voucher_message)
+    except Exception as e:
+        print(f"[AUTO] Delivery failed for {customer_key}: {e} - rolling back.")
+        with _proofs_lock:
+            registered_proofs[fp] = claimed
+        if reserved_here:
+            return_voucher(pkg_key, code)
+        return False
+
+    # --- success: close the transaction, burn the reference, drop the proof
+    history = user_memory.setdefault(customer_key, [{"role": "system", "content": system_rules}])
+    note_voucher_delivered(history, pkg_key)
+    mark_payment_used(info)                      # also removes the registered proof
+    pending_approvals.pop(customer_key, None)
+
+    label = customer_display.get(customer_key, str(customer_key))
+    if admin_chat_id:
+        try:
+            admin_bot.send_message(
+                admin_chat_id,
+                f"🤖 AUTO-APPROVED\n"
+                f"Customer: {label}\n"
+                f"Ref ending: {fp}  |  Paid: ${proof['amount']}"
+                + (f" (from {proof['sender']})" if proof.get("sender") else "") + "\n"
+                f"Package: {pkg_key}\n"
+                f"Voucher sent: {code}\n"
+                f"The registered proof was removed from memory."
+            )
+        except Exception as e:
+            print(f"[AUTO] Could not notify admin: {e}")
+    save_state()
+    return True
+
+
+# ---- admin-bot side ---------------------------------------------------------
+
+def register_proofs_from_admin(text):
+    proofs = parse_proof_blocks(text)
+    if not proofs:
+        return ("⚠️ That looks like a payment confirmation, but I couldn't read both an amount "
+                "(e.g. USD 1.00) and an 'Approval Code'. Please paste the full confirmation as received.")
+    lines = []
+    for p in proofs:
+        fp = proof_fingerprint(p["full_ref"])
+        if fp in used_payment_refs:
+            lines.append(f"⚠️ Ref ending {fp} was already redeemed - NOT registered.")
+            continue
+        with _proofs_lock:
+            replaced = fp in registered_proofs
+            registered_proofs[fp] = p
+
+        # A customer may already be waiting on this exact payment - serve them now.
+        served = []
+        for ckey, cinfo in list(pending_approvals.items()):
+            if proof_fingerprint(cinfo.get("code_ending")) == fp and try_auto_approve(ckey):
+                served.append(customer_display.get(ckey, str(ckey)))
+
+        who = f" from {p['sender']}" if p["sender"] else ""
+        line = f"✅ {'Updated' if replaced else 'Registered'}: ${p['amount']}{who}, ref ending {fp}."
+        if served:
+            line += f" A waiting customer ({', '.join(served)}) was auto-approved right away."
+        else:
+            line += " Will auto-approve when a customer sends a matching proof."
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def list_proofs_text():
+    with _proofs_lock:
+        items = list(registered_proofs.items())
+    if not items:
+        return "📭 No registered proofs waiting."
+    lines = [f"- ref ending {fp}: ${p['amount']}" + (f" from {p['sender']}" if p.get("sender") else "")
+             for fp, p in items]
+    return "🧾 Registered proofs (auto-approve on match):\n" + "\n".join(lines) + \
+           "\n\nRemove one with /delproof <last 7 chars of the approval code>"
+
+
+def handle_proof_admin_message(text):
+    """Returns a reply string if this admin message was proof-related, else None."""
+    low = text.lower().strip()
+    if low in ('/proofs', 'proofs'):
+        return list_proofs_text()
+    if low.startswith('/delproof'):
+        fp = proof_fingerprint(text[len('/delproof'):].strip())
+        if not fp:
+            return "Usage: /delproof <last 7 (or all) characters of the approval code>"
+        with _proofs_lock:
+            removed = registered_proofs.pop(fp, None)
+        return f"🗑️ Removed proof ending {fp}." if removed else f"⚠️ No registered proof ending {fp}."
+    if PROOF_MARKER_RE.search(text):
+        return register_proofs_from_admin(text)
+    return None
+
 # ==========================================
 # RECONCILIATION: reconnect returning customers across Intergram chat-id changes
 # ==========================================
@@ -825,6 +1091,10 @@ def handle_customer_message(message):
         # Either way: no LLM call (so nothing can be improvised), and the admin
         # gets bumped (subject to cooldown) instead of silently hearing nothing.
         if pending_info and pending_info.get("alert_sent"):
+            # If the admin has registered this payment's proof since the customer
+            # first sent it, a simple follow-up ("resend", "hi") can now complete it.
+            if try_auto_approve(customer_key):
+                return
             maybe_bump_admin_for_pending(customer_key, text, label)
             reply_text = ensure_closing_warning(
                 "Your payment is still with our team for verification — we haven't forgotten you. "
@@ -853,6 +1123,10 @@ def handle_customer_message(message):
                 # (not by the AI's memory of a previous, unrelated transaction).
                 "phone_confirmed": bool(extracted_phone),
                 "package_confirmed": bool(extracted_pkg),
+                # What the CUSTOMER claims they paid / the full reference they quoted.
+                # Used to verify against an admin-registered proof for auto-approval.
+                "claimed_amount": extract_payment_amount(text),
+                "claimed_ref": extract_full_reference_from_text(text),
             }
             if is_repeat_customer:
                 # Tell the model explicitly not to reuse stale slot values from earlier
@@ -869,6 +1143,9 @@ def handle_customer_message(message):
                     )
                 })
         else:
+            if extract_payment_amount(text):
+                current_pending["claimed_amount"] = extract_payment_amount(text)
+                current_pending["claimed_ref"] = extract_full_reference_from_text(text)
             if extracted_phone:
                 current_pending["phone"] = extracted_phone
                 current_pending["phone_confirmed"] = True
@@ -886,6 +1163,13 @@ def handle_customer_message(message):
                 pending_approvals[customer_key]["package"] = extracted_pkg
                 pending_approvals[customer_key]["package_key"] = extracted_pkg
                 pending_approvals[customer_key]["package_confirmed"] = True
+
+    # 2. AUTO-APPROVAL: if the admin pre-registered this exact payment proof (amount +
+    #    approval code match) and a matching voucher is in stock, deliver it right now,
+    #    skip the AI entirely, and delete the registered proof. Anything that doesn't
+    #    line up returns False and the normal AI + admin approval flow continues below.
+    if try_auto_approve(customer_key):
+        return
 
     user_memory[customer_key].append({"role": "user", "content": text})
     customer_bot.send_chat_action(message.chat.id, 'typing')
@@ -1038,6 +1322,10 @@ def handle_customer_message(message):
                             return_voucher(existing.get("package_key"), existing["proposed_code"])
 
                         pending_approvals[customer_key] = parsed
+                        # Carry over what the customer claimed, so a proof the admin registers
+                        # LATER can still be verified against it and auto-approve this customer.
+                        pending_approvals[customer_key]["claimed_amount"] = existing.get("claimed_amount")
+                        pending_approvals[customer_key]["claimed_ref"] = existing.get("claimed_ref")
                         pkg_key = normalize_package(parsed['package'])
                         reserved_code = reserve_voucher(pkg_key)
                         pending_approvals[customer_key]["package_key"] = pkg_key
@@ -1110,6 +1398,7 @@ def handle_customer_left(message):
     customer_key = f"{message.chat.id}:{left_user.id}"
     cancel_pending_for_customer(customer_key)
 
+
 # ==========================================
 # BOT 2: ADMIN BOT HANDLER
 # ==========================================
@@ -1164,6 +1453,15 @@ def handle_admin_message(message):
             message,
             "✏️ Type a code to be deleted.\nOptionally add the package: <code> from <package>"
         )
+        return
+
+    # Pre-registered proofs of payment (auto-approval). This MUST run before the bulk-add
+    # check below, because a pasted "Approval Code: XXX\nNew balance: ..." would otherwise be
+    # mistaken for a "CODE: xxx / <package>" voucher-add entry.
+    proof_reply = handle_proof_admin_message(text)
+    if proof_reply is not None:
+        admin_bot.reply_to(message, proof_reply)
+        save_state()
         return
 
     awaiting = None
@@ -1313,7 +1611,8 @@ def handle_admin_message(message):
         admin_bot.reply_to(
             message,
             "⚠️ Unknown command. Available:\n"
-            "/stock, /stockfull, /stockdetail, /listcodes, /codes, /addcode, /deletecode"
+            "/stock, /stockfull, /stockdetail, /listcodes, /codes, /addcode, /deletecode, "
+            "/proofs, /delproof"
         )
         return
 
@@ -1483,9 +1782,11 @@ def run_admin_bot():
 
 if __name__ == "__main__":
     import sys
-    print("[VERSION] splash_bot.py — build with lenient package matching + open-pending guard fix + Intergram reconnect", flush=True)
+    print("[VERSION] splash_bot.py — lenient package matching + open-pending guard fix + Intergram reconnect + pre-registered proof auto-approval", flush=True)
     load_state()
     print(f"[Groq] Loaded {len(groq_clients)} API key(s) for rotation/fallback.", flush=True)
+    print(f"[AUTO] Auto-approval {'ENABLED' if AUTO_APPROVE_ENABLED else 'DISABLED'} "
+          f"({len(registered_proofs)} registered proof(s) loaded).", flush=True)
     Thread(target=run_customer_bot).start()
     Thread(target=run_admin_bot).start()
     port = int(os.environ.get('PORT', 5000))
