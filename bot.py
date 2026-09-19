@@ -457,31 +457,6 @@ def delete_voucher(code, package_key=None):
     return None
 
 
-def deduplicate_inventory():
-    """
-    Remove duplicate voucher codes from stock (keeping the first occurrence
-    of each code across all packages). Returns {package_key: [removed_codes]}
-    for packages that had at least one duplicate removed.
-    """
-    removed_by_package = {}
-    with _inventory_lock:
-        seen_codes = set()
-        for pkg, codes in voucher_inventory.items():
-            deduped = []
-            removed = []
-            for c in codes:
-                key = c.lower()
-                if key in seen_codes:
-                    removed.append(c)
-                else:
-                    seen_codes.add(key)
-                    deduped.append(c)
-            voucher_inventory[pkg] = deduped
-            if removed:
-                removed_by_package[pkg] = removed
-    return removed_by_package
-
-
 ADD_CODE_PATTERN = re.compile(
     r'^\s*add\s+code\s+(?P<code>\S+)\s+for\s+(?P<package>.+?)\s*$',
     re.IGNORECASE
@@ -654,23 +629,6 @@ def handle_admin_message(message):
             codes_str = ", ".join(codes) if codes else "(none)"
             lines.append(f"- {pkg} ({info['price']}, {info['data']}): {codes_str}")
         admin_bot.reply_to(message, "📦 Voucher stock (detailed):\n" + "\n".join(lines))
-        return
-
-    if text.strip().lower() in ['/deleteduplicates', 'deleteduplicates', 'delete duplicates', 'dedupe', 'deduplicate']:
-        removed_by_package = deduplicate_inventory()
-        if not removed_by_package:
-            admin_bot.reply_to(message, "✅ No duplicate codes found - stock is already clean.")
-        else:
-            total_removed = sum(len(v) for v in removed_by_package.values())
-            lines = [
-                f"- {pkg}: removed {', '.join(codes)}"
-                for pkg, codes in removed_by_package.items()
-            ]
-            admin_bot.reply_to(
-                message,
-                f"🧹 Removed {total_removed} duplicate code(s):\n" + "\n".join(lines)
-            )
-            save_state()
         return
 
     # ------------------------------------------------------------------
