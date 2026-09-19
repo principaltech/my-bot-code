@@ -206,7 +206,7 @@ PACKAGES = {
     "$1:UNL:24HRS": {"price": "$1.00", "data": "UNLIMITED"},
     "2 DAYS": {"price": "$0.50", "data": "5GB"},
     "7 DAYS": {"price": "$1.00", "data": "12GB"},
-    "14 DAYS PRO": {"price": "$5.00", "data": "UNLIMITED"},
+    "$5 = Unlimited 14d": {"price": "$5.00", "data": "UNLIMITED"},
     "30 DAYS LITE": {"price": "$10.00", "data": "UNLIMITED"},
 }
 
@@ -226,7 +226,7 @@ You are an automated customer care AI assistant for Splash Internet. You MUST fo
    - $1:UNL:24HRS = USD $1.00 = UNLIMITED
    - 2 DAYS = USD $0.50 = 5GB
    - 7 DAYS = USD $1.00 = 12GB
-   - 14 DAYS PRO = USD $5.00 = UNLIMITED
+   - $5 = Unlimited 14d = USD $5.00 = UNLIMITED
    - 30 DAYS LITE = USD $10.00 = UNLIMITED
 3. PAYMENTS & PROOF OF PAYMENT:
    - EcoCash number is 0776248396.
@@ -461,7 +461,7 @@ PACKAGE_DURATION_MAP = {
     ("24", "h"): "$1:UNL:24HRS",
     ("2", "d"): "2 DAYS",
     ("7", "d"): "7 DAYS",
-    ("14", "d"): "14 DAYS PRO",
+    ("14", "d"): "$5 = Unlimited 14d",
     ("30", "d"): "30 DAYS LITE",
 }
 DURATION_RE = re.compile(r'\b(\d{1,2})\s*-?\s*(days?|d|hours?|hrs?|h)\b', re.IGNORECASE)
