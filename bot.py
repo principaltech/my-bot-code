@@ -442,10 +442,7 @@ def return_voucher(package_key, code):
     if not package_key or not code:
         return
     with _inventory_lock:
-        codes = voucher_inventory.setdefault(package_key, [])
-        # Don't reintroduce a duplicate if it's somehow already back in stock.
-        if not any(c.lower() == code.lower() for c in codes):
-            codes.insert(0, code)
+        voucher_inventory.setdefault(package_key, []).insert(0, code)
 
 
 def delete_voucher(code, package_key=None):
@@ -463,14 +460,9 @@ def delete_voucher(code, package_key=None):
 def deduplicate_inventory():
     """
     Remove duplicate voucher codes from stock, keeping the first occurrence
-    of each code within a package (and dropping a code entirely from a
-    later package if it already appeared in an earlier one - the same
-    voucher code should never be listed twice, whether that's a repeat
-    within one package or the same code mistakenly added under two
-    different packages).
-
-    Returns a dict: {package_key: [removed_codes]} for packages that had
-    at least one duplicate removed.
+    of each code (checked across all packages, since the same code should
+    never sit under two different packages either). Returns a dict of
+    {package_key: [removed_codes]} for packages that had duplicates removed.
     """
     removed_by_package = {}
     with _inventory_lock:
@@ -774,11 +766,6 @@ def handle_admin_message(message):
                 continue
 
             with _inventory_lock:
-                # Refuse to store the same code twice - whether it's already
-                # sitting in this exact package or was added under a
-                # different one by mistake. A voucher code should only ever
-                # be handed out once, so keeping two copies around risks it
-                # being sent to two different customers.
                 already_exists = any(
                     code.lower() == c.lower()
                     for codes in voucher_inventory.values()
