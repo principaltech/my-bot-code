@@ -577,7 +577,8 @@ REBUMP_COOLDOWN_SECONDS = 10 * 60  # don't nudge admin more than once per 10 min
 FOLLOWUP_STATUS_RE = re.compile(
     r'\b(where.?s?\s+my\s+code|any\s+update|did\s+you\s+(get|receive)|status|'
     r'still\s+waiting|already\s+paid|already\s+sent|didn.?t\s+get|'
-    r'haven.?t\s+received|hello|hi|helo)\b',
+    r'haven.?t\s+received|resend|re-?send|send\s+(it|the\s+code|my\s+code)|'
+    r'waiting\s+for\s+(my\s+)?code|hello|hi|helo)\b',
     re.IGNORECASE
 )
 
@@ -652,12 +653,22 @@ def maybe_bump_admin_for_pending(customer_key, text, label):
         return False  # already nudged recently, don't spam
 
     if admin_chat_id:
-        admin_bot.send_message(
-            admin_chat_id,
-            f"⏰ Reminder: {label} is still waiting on a decision "
-            f"(code ending {info.get('code_ending')}, {info.get('package')}, "
-            f"phone {info.get('phone')}). Reply YES/NO, or a code, to resolve."
-        )
+        if info.get("proposed_code"):
+            admin_bot.send_message(
+                admin_chat_id,
+                f"⏰ Reminder: {label} is still waiting on their voucher "
+                f"(code ending {info.get('code_ending')}, {info.get('package')}, "
+                f"phone {info.get('phone')}). A stored code is already reserved for them "
+                f"('{info['proposed_code']}') — reply YES to send it, or NO to hold it."
+            )
+        else:
+            admin_bot.send_message(
+                admin_chat_id,
+                f"⏰ Reminder: {label} is still waiting on a decision "
+                f"(code ending {info.get('code_ending')}, {info.get('package')}, "
+                f"phone {info.get('phone')}). No stock code is reserved yet — reply with a "
+                f"voucher code to approve, or 'no' to reject."
+            )
     info["last_alert_time"] = now
     save_state()
     return True
@@ -700,7 +711,12 @@ def handle_customer_message(message):
     if not extracted_ref:
         label = customer_display.get(customer_key, customer_key)
         pending_info = pending_approvals.get(customer_key)
-        if pending_info and pending_info.get("alert_sent") and not pending_info.get("proposed_code"):
+        # Covers BOTH sub-states of an open, already-alerted transaction:
+        #   - a stock code is reserved and we're waiting on admin's YES/NO, or
+        #   - nothing is in stock and we're waiting on admin to supply a code.
+        # Either way: no LLM call (so nothing can be improvised), and the admin
+        # gets bumped (subject to cooldown) instead of silently hearing nothing.
+        if pending_info and pending_info.get("alert_sent"):
             maybe_bump_admin_for_pending(customer_key, text, label)
             reply_text = ensure_closing_warning(
                 "Your payment is still with our team for verification — we haven't forgotten you. "
