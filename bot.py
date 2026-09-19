@@ -4,7 +4,8 @@ import re
 import json
 import sqlite3
 import time
-from flask import Flask
+import hmac
+from flask import Flask, request, jsonify
 from threading import Thread, Lock
 from groq import Groq
 
@@ -1746,6 +1747,74 @@ app = Flask(__name__)
 def home():
     return "Dual-Bot System Running!"
 
+# ------------------------------------------
+# SMS WEBHOOK: your phone forwards each EcoCash confirmation SMS here, and the proof is
+# registered automatically (exactly as if you had pasted it into the admin bot).
+#
+# Phone app (webhook-smsforwarder) sends:  POST /sms   JSON {"sender","message","sim","device"}
+# with the header:                         X-Webhook-Secret: <SMS_WEBHOOK_SECRET>
+#
+# Env vars:
+#   SMS_WEBHOOK_SECRET   (required - the endpoint stays disabled until this is set)
+#   SMS_ALLOWED_SENDERS  (optional, comma-separated, e.g. "EcoCash" - extra sender filter)
+# ------------------------------------------
+SMS_WEBHOOK_SECRET = os.environ.get("SMS_WEBHOOK_SECRET", "").strip()
+SMS_ALLOWED_SENDERS = [
+    re.sub(r'[^a-z0-9]', '', s.lower())
+    for s in os.environ.get("SMS_ALLOWED_SENDERS", "").split(",") if s.strip()
+]
+
+def _sms_secret_ok(req):
+    if not SMS_WEBHOOK_SECRET:
+        return False
+    supplied = (req.headers.get("X-Webhook-Secret") or "").strip()
+    if not supplied:
+        auth = (req.headers.get("Authorization") or "").strip()
+        if auth.lower().startswith("bearer "):
+            supplied = auth[7:].strip()
+    if not supplied:
+        return False
+    return hmac.compare_digest(supplied.encode("utf-8"), SMS_WEBHOOK_SECRET.encode("utf-8"))
+
+@app.route('/sms', methods=['GET', 'POST'])
+def sms_webhook():
+    if request.method == 'GET':
+        return "SMS webhook is up (POST only).", 200
+    if not SMS_WEBHOOK_SECRET:
+        return jsonify({"status": "disabled"}), 503
+    if not _sms_secret_ok(request):
+        return jsonify({"status": "unauthorized"}), 401
+
+    data = request.get_json(silent=True) or {}
+    sender = str(data.get("sender") or "").strip()
+    body = str(data.get("message") or "").strip()
+    if not body:
+        return jsonify({"status": "ignored", "reason": "empty message"}), 200
+
+    if SMS_ALLOWED_SENDERS:
+        sender_norm = re.sub(r'[^a-z0-9]', '', sender.lower())
+        if not any(allowed in sender_norm for allowed in SMS_ALLOWED_SENDERS):
+            print(f"[SMS] Ignored message from unlisted sender '{sender}'.")
+            return jsonify({"status": "ignored", "reason": "sender not allowed"}), 200
+
+    # Only EcoCash-style confirmations (with an "Approval Code") are ever registered.
+    if not PROOF_MARKER_RE.search(body):
+        return jsonify({"status": "ignored", "reason": "not a payment confirmation"}), 200
+
+    result = register_proofs_from_admin(body)
+    save_state()
+    print(f"[SMS] Processed confirmation from '{sender}'.")
+    if admin_chat_id:
+        try:
+            admin_bot.send_message(
+                admin_chat_id,
+                f"📲 EcoCash SMS received (sender: {sender or 'unknown'})\n{result}\n\n"
+                "If this wasn't a real payment, remove it with /delproof <last 7 chars>."
+            )
+        except Exception as e:
+            print(f"[SMS] Could not notify admin: {e}")
+    return jsonify({"status": "processed"}), 200
+
 def run_customer_bot():
     # Watchdog: pyTelegramBotAPI's infinity_polling() is *supposed* to retry forever on any
     # exception, but a 409 Conflict from getUpdates (e.g. during a Render rolling deploy, where
@@ -1787,6 +1856,7 @@ if __name__ == "__main__":
     print(f"[Groq] Loaded {len(groq_clients)} API key(s) for rotation/fallback.", flush=True)
     print(f"[AUTO] Auto-approval {'ENABLED' if AUTO_APPROVE_ENABLED else 'DISABLED'} "
           f"({len(registered_proofs)} registered proof(s) loaded).", flush=True)
+    print(f"[SMS] Webhook /sms {'ENABLED' if SMS_WEBHOOK_SECRET else 'DISABLED (set SMS_WEBHOOK_SECRET to enable)'}.", flush=True)
     Thread(target=run_customer_bot).start()
     Thread(target=run_admin_bot).start()
     port = int(os.environ.get('PORT', 5000))
