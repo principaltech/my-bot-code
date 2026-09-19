@@ -572,7 +572,8 @@ def cancel_pending_for_customer(customer_key, reason="left the chat"):
 # phone number (the one thing that stays stable across sessions) instead of
 # silently dropping them or firing a brand-new admin alert for the same payment.
 
-REBUMP_COOLDOWN_SECONDS = 10 * 60  # don't nudge admin more than once per 10 min
+REBUMP_COOLDOWN_SECONDS = 15  # just enough to absorb accidental double-sends/webhook retries,
+                               # not to make an impatient customer wait for a re-alert
 
 FOLLOWUP_STATUS_RE = re.compile(
     r'\b(where.?s?\s+my\s+code|any\s+update|did\s+you\s+(get|receive)|status|'
