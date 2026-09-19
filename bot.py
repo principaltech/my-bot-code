@@ -476,6 +476,39 @@ def extract_package_from_duration(text):
     unit = "h" if m.group(2).lower().startswith("h") else "d"
     return PACKAGE_DURATION_MAP.get((num, unit))
 
+# Price-based inference: if the EcoCash amount in the proof-of-payment text matches
+# the price of exactly ONE package, we can safely fill the package slot ourselves
+# instead of making the customer type it. If the amount is shared by more than one
+# package (e.g. two packages both cost $1.00), it stays ambiguous and we still ask -
+# guessing wrong would sell the customer the wrong voucher.
+PRICE_TO_PACKAGES = {}
+for _pkg, _info in PACKAGES.items():
+    _amt = _info["price"].replace("$", "").strip()
+    PRICE_TO_PACKAGES.setdefault(_amt, []).append(_pkg)
+
+AMOUNT_RE = re.compile(r'(?:USD|\$)\s*(\d+(?:\.\d{1,2})?)', re.IGNORECASE)
+BALANCE_CONTEXT_RE = re.compile(r'balance', re.IGNORECASE)
+
+def extract_package_from_price(text):
+    if not text:
+        return None
+    candidates = []
+    for m in AMOUNT_RE.finditer(text):
+        start, end = m.span()
+        window = text[max(0, start - 20):min(len(text), end + 20)]
+        if BALANCE_CONTEXT_RE.search(window):
+            continue  # skip "New balance: USD X.XX" - that's not the payment amount
+        candidates.append(m.group(1))
+    if not candidates:
+        return None
+    amount = candidates[0]  # the transaction amount is virtually always the first non-balance figure
+    try:
+        normalized = f"{float(amount):.2f}"
+    except ValueError:
+        return None
+    matched = PRICE_TO_PACKAGES.get(normalized, [])
+    return matched[0] if len(matched) == 1 else None
+
 def extract_customer_package(text):
     if not text:
         return None
@@ -486,7 +519,10 @@ def extract_customer_package(text):
     compact_matches = {p for alias, p in PACKAGE_ALIASES.items() if alias in compact}
     if len(compact_matches) == 1:
         return next(iter(compact_matches))
-    return extract_package_from_duration(text)
+    pkg = extract_package_from_duration(text)
+    if pkg:
+        return pkg
+    return extract_package_from_price(text)
 
 def reserve_voucher(package_key):
     if not package_key:
