@@ -3,10 +3,10 @@ import os
 import re
 import json
 import sqlite3
+import time
 from flask import Flask
 from threading import Thread, Lock
 from groq import Groq
-import librouteros
 
 # Tokens
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")       # Bot 1: Customer Bot
@@ -18,17 +18,12 @@ admin_bot = telebot.TeleBot(ADMIN_BOT_TOKEN)
 # ==========================================
 # ADMIN AUTHENTICATION
 # ==========================================
-# Comma-separated Telegram user IDs allowed to act as admin, e.g.
-# ADMIN_USER_IDS="123456789,987654321" in your environment.
-# Without this set, the admin bot refuses everyone (fail closed, not open) -
-# previously *anyone* who found the admin bot and said "hi" became the admin.
 _admin_ids_raw = os.environ.get("ADMIN_USER_IDS", "")
 ADMIN_USER_IDS = {
     int(x.strip()) for x in _admin_ids_raw.split(",") if x.strip().isdigit()
 }
 if not ADMIN_USER_IDS:
     print("[WARN] ADMIN_USER_IDS is not set - the admin bot will reject everyone until it is.")
-
 
 def is_authorized_admin(message):
     u = message.from_user
@@ -59,14 +54,12 @@ groq_clients = [Groq(api_key=key) for key in GROQ_API_KEYS]
 _key_index_lock = Lock()
 _current_key_index = 0
 
-
 def _next_key_index():
     global _current_key_index
     with _key_index_lock:
         idx = _current_key_index
         _current_key_index = (_current_key_index + 1) % len(groq_clients)
     return idx
-
 
 def create_completion(messages, **kwargs):
     start = _next_key_index()
@@ -84,109 +77,19 @@ def create_completion(messages, **kwargs):
 
     raise last_error
 
-
-# ==========================================
-# MIKROTIK USER MANAGER (voucher codes over ZeroTier)
-# ==========================================
-# RouterOS 7 User Manager lives under the "/user-manager" console menu
-# (RouterOS 6's old "/tool/user-manager" path does not exist in v7).
-# The classic RouterOS binary API (port 8728/8729) can execute any console
-# path, including /user-manager/*, so librouteros against that port works
-# fine here - no need for the separate REST/www-ssl interface.
-#
-# IMPORTANT: on the router, /ip service's api and api-ssl entries must allow
-# the Render bot's ZeroTier IP/subnet as a client ADDRESS, or nothing external
-# will ever be allowed to connect here.
-MIKROTIK_HOST = os.environ.get("MIKROTIK_HOST", "192.168.191.23")
-MIKROTIK_API_PORT = int(os.environ.get("MIKROTIK_API_PORT", "8728"))
-MIKROTIK_USERNAME = os.environ.get("MIKROTIK_USERNAME")
-MIKROTIK_PASSWORD = os.environ.get("MIKROTIK_PASSWORD")
-
-_mikrotik_lock = Lock()
-
-
-def _mikrotik_connect():
-    """Fresh connection per call rather than a kept-open socket - Render
-    containers restart often, and User Manager lookups are infrequent
-    enough that reconnecting each time costs nothing noticeable."""
-    if not (MIKROTIK_USERNAME and MIKROTIK_PASSWORD):
-        raise RuntimeError("MIKROTIK_USERNAME/MIKROTIK_PASSWORD not set")
-    return librouteros.connect(
-        host=MIKROTIK_HOST,
-        username=MIKROTIK_USERNAME,
-        password=MIKROTIK_PASSWORD,
-        port=MIKROTIK_API_PORT,
-        timeout=8,
-    )
-
-
-def fetch_um_code(comment):
-    """
-    Pull one unused User Manager voucher whose comment exactly matches
-    `comment`, and immediately re-tag it on the router so it can never
-    be handed out twice - even if two admins approve at the same moment.
-    Returns the username (the code customers type in), or None if
-    nothing is available under that comment or the router is unreachable.
-    """
-    with _mikrotik_lock:
-        try:
-            api = _mikrotik_connect()
-        except Exception as e:
-            print(f"[MikroTik] Connection failed: {e}")
-            return None
-
-        try:
-            users = list(api.path("user-manager", "user"))
-            candidates = [u for u in users if u.get("comment", "") == comment]
-            if not candidates:
-                return None
-
-            chosen = candidates[0]
-            username = chosen.get("name") or chosen.get("username")
-            user_id = chosen.get(".id")
-
-            # Re-tag instead of delete, so Winbox keeps an audit trail
-            # of which codes were actually issued.
-            api.path("user-manager", "user").update(
-                **{".id": user_id, "comment": f"{comment} USED"}
-            )
-            return username
-        except Exception as e:
-            print(f"[MikroTik] User Manager lookup failed: {e}")
-            return None
-        finally:
-            try:
-                api.close()
-            except Exception:
-                pass
-
-
 # ==========================================
 # STORAGE
 # ==========================================
-# IMPORTANT: keyed by a composite "customer_key" (chat_id + sender's user_id),
-# NOT by chat_id alone. If the customer bot is used inside a group (any chat
-# with a negative Telegram ID), every member shares the same chat.id, so
-# keying by chat_id alone collapses all customers into one record. Keying by
-# (chat_id, user_id) keeps each person's thread separate even inside a group,
-# while still working normally for private 1-on-1 chats.
 user_memory = {}
-user_last_message_id = {}   # customer_key -> message_id (for reply_to)
-customer_chat_id = {}       # customer_key -> chat_id to send messages back to
-customer_display = {}       # customer_key -> human-readable label for admin alerts
+user_last_message_id = {}   
+customer_chat_id = {}       
+customer_display = {}       
+customer_last_code = {}     
 admin_chat_id = None
 
 # ==========================================
-# PERSISTENCE (Postgres on Neon, SQLite fallback for local dev)
+# PERSISTENCE 
 # ==========================================
-# Everything above lived only in RAM before, so a restart/redeploy wiped
-# in-progress payments and your whole voucher stock.
-#
-# On most free hosting tiers the container's local disk is wiped on every
-# redeploy, so a local SQLite file does NOT survive. Set DATABASE_URL to a
-# hosted Postgres connection string (e.g. from neon.tech) and state persists
-# properly. With no DATABASE_URL set, this falls back to local SQLite, which
-# is fine for running on your own machine.
 DATABASE_URL = os.environ.get("DATABASE_URL")
 _db_lock = Lock()
 
@@ -233,16 +136,11 @@ else:
         row = _sqlite.execute("SELECT value FROM kv WHERE key = 'state'").fetchone()
         return row[0] if row else None
 
-    print(f"[DB] Using local SQLite at {DB_PATH} (no DATABASE_URL set). "
-          "This will NOT survive a redeploy on most hosts.")
+    print(f"[DB] Using local SQLite at {DB_PATH}.")
 
 _init_db()
 
-
 def save_state():
-    """Snapshot all mutable bot state to the database. Cheap enough to call
-    after every handler; called explicitly (not on a timer) so state on disk
-    is never more than one message behind."""
     global admin_chat_id
     snapshot = {
         "user_memory": user_memory,
@@ -250,7 +148,9 @@ def save_state():
         "user_last_message_id": user_last_message_id,
         "customer_chat_id": customer_chat_id,
         "customer_display": customer_display,
+        "customer_last_code": customer_last_code,
         "voucher_inventory": voucher_inventory,
+        "used_payment_refs": sorted(used_payment_refs),
         "admin_chat_id": admin_chat_id,
     }
     try:
@@ -259,9 +159,7 @@ def save_state():
     except Exception as e:
         print(f"[DB] Failed to save state: {e}")
 
-
 def load_state():
-    """Restore state saved by save_state(), if any. Called once at startup."""
     global admin_chat_id
     try:
         with _db_lock:
@@ -275,22 +173,18 @@ def load_state():
         user_last_message_id.update(snapshot.get("user_last_message_id", {}))
         customer_chat_id.update(snapshot.get("customer_chat_id", {}))
         customer_display.update(snapshot.get("customer_display", {}))
+        customer_last_code.update(snapshot.get("customer_last_code", {}))
+        used_payment_refs.update(snapshot.get("used_payment_refs", []))
         for pkg, codes in snapshot.get("voucher_inventory", {}).items():
             voucher_inventory[pkg] = codes
         admin_chat_id = snapshot.get("admin_chat_id")
-        total_codes = sum(len(v) for v in voucher_inventory.values())
-        print(f"[DB] Restored state: {len(user_memory)} customer thread(s), "
-              f"{len(pending_approvals)} pending approval(s), "
-              f"{total_codes} voucher code(s), admin_chat_id={admin_chat_id}")
     except Exception as e:
         print(f"[DB] Failed to load state: {e}")
-
 
 def make_customer_key(message):
     chat_id = message.chat.id
     user_id = message.from_user.id if message.from_user else chat_id
     return f"{chat_id}:{user_id}"
-
 
 def display_name_for(message):
     u = message.from_user
@@ -302,14 +196,12 @@ def display_name_for(message):
         return f"{name} (@{u.username})"
     return f"{name} (id {u.id})"
 
-
-# Tracks customers currently waiting on a voucher approval, keyed by
-# customer_key:
-#   {"code_ending": "...", "price": "...", "phone": "...", "package": "...",
-#    "proposed_code": "..." or None, "package_key": "..." or None}
 pending_approvals = {}
+used_payment_refs = set()
 
-# Package reference (price + data), mirrors the pricing table below.
+admin_awaiting = {}
+_admin_state_lock = Lock()
+
 PACKAGES = {
     "24 HOURS LITE": {"price": "$1.00", "data": "UNLIMITED"},
     "2 DAYS": {"price": "$0.50", "data": "5GB"},
@@ -320,6 +212,11 @@ PACKAGES = {
 
 voucher_inventory = {pkg: [] for pkg in PACKAGES}
 _inventory_lock = Lock()
+
+CLOSING_WARNING = (
+    "Do not close this current chat, otherwise you might not receive your login code, "
+    "token, or password because the chat ID changes."
+)
 
 system_rules = """
 You are an automated customer care AI assistant for Splash Internet. You MUST follow these rules strictly:
@@ -333,31 +230,132 @@ You are an automated customer care AI assistant for Splash Internet. You MUST fo
    - 30 DAYS LITE = USD $10.00 = UNLIMITED
 3. PAYMENTS & PROOF OF PAYMENT:
    - EcoCash number is 0776248396.
-   - You need three things: (a) the customer's phone number, (b) the package, and (c) proof of payment (a confirmation message or the last 4 digits of the transaction/reference).
-   - The package can be stated directly by the customer, OR inferred from the amount they paid. If the amount matches EXACTLY ONE package price, treat that as confirmed automatically - do NOT ask the customer to confirm it again, that wastes their time. Just state which package you matched them to and move straight on to rule 4 and rule 5 in the same reply.
-   - Only ask a clarifying question about the package if the amount paid matches more than one package price (e.g. $1.00 = both 24 HOURS LITE and 7 DAYS) or matches no known price at all.
-   - EXTRACTING THE TRANSACTION REFERENCE: proof-of-payment messages often contain a labelled reference such as "Approval Code: PP260917.1524.T3000820", "Transaction ID: ...", "Ref: ...", or "Confirmation code: ...". When such a label is present, CODE_ENDING MUST be the last 4 characters of that specific code (letters and digits only, ignore punctuation) - e.g. "T3000820" -> "0820". Do NOT substitute the phone number's last 4 digits when a transaction reference is present, even if it looks unfamiliar or contains letters. Only use the phone number's last 4 digits as a last resort when the customer's message contains no transaction/approval/reference code at all.
+   - You need three things: (a) the customer's phone number, (b) the package, and (c) proof of payment.
+   - DISTINGUISH REPLIES: If the user is just answering a question about which package they want (e.g. saying "7d", "7 days", "lite"), DO NOT treat it as a payment reference. Only evaluate transaction references when a full payment confirmation block is provided.
+   - A VALID TRANSACTION REFERENCE MUST BE AT LEAST 7 CHARACTERS LONG. If a user provides a reference that is less than 7 characters as a payment code, reject it.
+   - EXTRACTING THE TRANSACTION REFERENCE: Look for the longest alphanumeric string in the message. CODE_ENDING MUST be the EXACT last 7 characters of that full reference. Ignore punctuation like dots or dashes. NEVER accept or use a code shorter than 7 characters.
 4. AFTER PAYMENT PROOF IS SUBMITTED:
-   - Tell the user to wait 30 seconds while the payment is validated.
+   - Tell the user to wait 30 seconds while the payment is validated. That is ALL you say about the outcome.
+   - CRITICAL: Do NOT attempt to repeat, quote, or summarize the customer's transaction reference back to them in your conversational reply. The reference must ONLY be output inside the [ADMIN_ALERT] tag.
 5. ADMIN PAYMENT APPROVAL (CRITICAL INSTRUCTION):
-   - When a user submits proof of payment, you MUST generate the exact tag [ADMIN_ALERT] followed immediately by a structured line in EXACTLY this format (pipe-separated, one line, then your own short note after a dash):
-     [ADMIN_ALERT] CODE_ENDING: <last 4 characters of the transaction/approval reference, or phone last 4 if truly no reference was given> | PRICE: $<amount> | PHONE: <customer phone number> | PACKAGE: <package name> - Admin, please provide a voucher code.
-   - Fill in every field. If you used the phone number instead of a transaction reference, say so explicitly in your note.
-   - The system automatically checks real voucher stock for you - you do not need to track or remember whether a code is available. Just always send an accurate alert; the backend and admin decide what happens next.
-   - NEVER tell the user you forwarded the payment without including this exact [ADMIN_ALERT] structured line.
+   - When a user has provided their phone number, package, AND a valid payment reference (minimum 7 chars), generate the exact tag [ADMIN_ALERT] followed immediately by a structured line:
+     [ADMIN_ALERT] CODE_ENDING: <exact last 7 characters> | PRICE: $<amount> | PHONE: <customer phone number> | PACKAGE: <package name> - Admin, please provide a voucher code.
+   - NEVER generate this alert if the code is under 7 characters.
 6. ADMIN REPLIES:
-   - You will never need to interpret or forward admin replies yourself - the backend now matches the admin's reply to the correct customer and delivers the voucher (or rejection) directly and automatically. You do not need to output [IGNORE_ADMIN] or handle raw codes.
+   - You will never need to interpret or forward admin replies yourself. The backend handles this.
 7. MANDATORY CLOSING WARNING:
    - You MUST include this exact warning at the end of EVERY customer response: "Do not close this current chat, otherwise you might not receive your login code, token, or password because the chat ID changes."
 8. SCOPE: Only answer about Splash Internet.
+9. NO CODES, NO APPROVALS (ABSOLUTE, OVERRIDES EVERYTHING ELSE):
+   - You do NOT have access to any voucher codes, login codes, tokens, usernames or passwords. You must NEVER write, invent, guess or repeat one, in any format.
+   - You must NEVER say or imply that a payment "has been approved", "verified", "confirmed" or "successful". You cannot know that.
+10. FRESH TRANSACTIONS:
+   - If you see a SYSTEM NOTE telling you a new payment reference was submitted, treat it as a completely separate, brand-new transaction. Do NOT reuse a phone number or package mentioned earlier in this chat for that new reference. Ask the customer to (re)confirm both before producing any [ADMIN_ALERT].
+11. NEVER FABRICATE A "PAYMENT RECEIVED" REPLY:
+   - Only tell the customer their payment was received / to wait 30 seconds if THIS message actually contains a new, valid transaction reference. If the customer's latest message is something else (a package choice, "resend", a greeting, etc.) with no reference in it, do NOT repeat or imply an earlier payment confirmation from chat history - ask them for the actual proof of payment instead.
 """
 
-def parse_admin_alert(alert_text):
-    """
-    Extract CODE_ENDING / PRICE / PHONE / PACKAGE from a structured
-    [ADMIN_ALERT] line. Returns None if the AI didn't follow the format,
-    in which case we fall back to forwarding the raw text.
-    """
+WAIT_MESSAGE = "Thank you, we have received your payment proof. Please wait about 30 seconds while we validate the payment."
+NEED_PROOF_MESSAGE = ("Please send your phone number, the package you want, and your proof of payment "
+                      "(the EcoCash confirmation message or the exact transaction reference).")
+DUPLICATE_MESSAGE = ("This payment proof has already been processed. If you did not receive your voucher, "
+                     "please scroll up in this chat to find it, or contact support.")
+
+PHONE_PATTERN = re.compile(r'\b(07\d{8}|\+?2637\d{8})\b')
+
+def extract_phone_from_text(text):
+    if not text:
+        return None
+    m = PHONE_PATTERN.search(text)
+    return m.group(1) if m else None
+
+FAKE_APPROVAL_RE = re.compile(
+    r'(?:payment\s+(?:has\s+been|was|is|is\s+now)\s+(?:approved|verified|confirmed|successful))'
+    r'|(?:(?:voucher|login|access|wifi|wi-fi)\s*(?:code|pin)\s*\**\s*[:\-\u2013\u2014=]\s*\**\s*[A-Za-z0-9])'
+    r'|(?:\b(?:token|password|username|pin)\s*\**\s*[:=]\s*\**\s*[A-Za-z0-9])',
+    re.IGNORECASE
+)
+SUSPICIOUS_TOKEN_RE = re.compile(r'\b(?=[A-Za-z0-9]*[A-Za-z])(?=[A-Za-z0-9]*\d)[A-Za-z0-9]{6,14}\b')
+
+# Detects the model fabricating a "we received your payment, please wait" style reply
+# purely from chat history, with no genuine new proof submitted this turn.
+FAKE_RECEIPT_RE = re.compile(
+    r'payment\s+of.{0,40}?(?:has\s+been|was)\s+received'
+    r'|your\s+payment.{0,60}?received.{0,60}?wait'
+    r'|please\s+wait.{0,40}?(?:30\s*seconds|validat\w*\s+the\s+payment)',
+    re.IGNORECASE | re.DOTALL
+)
+NO_GENUINE_PROOF_MESSAGE = (
+    "I don't see a new payment proof or transaction reference in your last message. "
+    "If you already paid, please resend the full EcoCash confirmation or transaction reference "
+    "so we can process it."
+)
+
+def strip_fake_approval(reply, known_text=""):
+    if not reply:
+        return "", False
+    known = (known_text or "").lower()
+    cut = None
+    m = FAKE_APPROVAL_RE.search(reply)
+    if m:
+        cut = m.start()
+    for tm in SUSPICIOUS_TOKEN_RE.finditer(reply):
+        if tm.group(0).lower() not in known:
+            cut = tm.start() if cut is None else min(cut, tm.start())
+            break
+    if cut is None:
+        return reply, False
+    line_start = reply.rfind('\n', 0, cut) + 1
+    return reply[:line_start].rstrip(), True
+
+def ensure_closing_warning(text):
+    if "do not close this current chat" in text.lower():
+        return text
+    return f"{text}\n\n{CLOSING_WARNING}"
+
+def payment_fingerprint(info):
+    if not info:
+        return None
+    ending = re.sub(r'[^a-z0-9]', '', (info.get("code_ending") or "").lower())
+    if not ending or len(ending) < 7:
+        return None
+    return ending[-7:]
+
+def mark_payment_used(info):
+    fp = payment_fingerprint(info)
+    if fp:
+        used_payment_refs.add(fp)
+
+def note_voucher_delivered(history, package):
+    history.append({
+        "role": "system",
+        "content": (
+            f"SYSTEM NOTE: The backend successfully processed the payment for {package} and delivered "
+            "the voucher to the customer. THAT TRANSACTION IS COMPLETELY CLOSED. "
+            "Do NOT refer to the old payment or old reference code again. "
+            "If the customer sends a new message (like a phone number), assume they want to buy a NEW voucher, "
+            "and ask them for their NEW proof of payment and package."
+        )
+    })
+
+TRANSACTION_REF_PATTERN = re.compile(
+    r'(?:approval\s*code|transaction\s*id|trans(?:action)?\s*ref(?:erence)?|confirmation\s*code|ref(?:erence)?\s*(?:no\.?|number)?)\s*[:#]?\s*'
+    r'([A-Za-z0-9][A-Za-z0-9.\-]{6,})',
+    re.IGNORECASE
+)
+
+def extract_code_ending_from_text(text):
+    if not text:
+        return None
+    m = TRANSACTION_REF_PATTERN.search(text)
+    if not m:
+        return None
+    raw = re.sub(r'[^A-Za-z0-9]', '', m.group(1))
+    if len(raw) >= 7:
+        return raw[-7:]
+    return None
+
+def parse_admin_alert(alert_text, user_text="", authoritative_code=None):
     pattern = re.compile(
         r'CODE_ENDING:\s*(?P<code>[^|]+)\|\s*PRICE:\s*(?P<price>[^|]+)\|\s*PHONE:\s*(?P<phone>[^|]+)\|\s*PACKAGE:\s*(?P<package>[^\n]+)',
         re.IGNORECASE
@@ -365,56 +363,75 @@ def parse_admin_alert(alert_text):
     m = pattern.search(alert_text)
     if not m:
         return None
+        
+    code_ending = m.group("code").strip(" -\u2014:")
+    code_alphanum = re.sub(r'[^A-Za-z0-9]', '', code_ending)
+    
+    real_ending = extract_code_ending_from_text(user_text)
+
+    # Preference order for the code ending:
+    # 1. The code we ALREADY confirmed for this customer's open transaction (most trustworthy -
+    #    this came from a genuine proof-of-payment message earlier, not from the AI's memory).
+    # 2. A reference freshly extracted from the customer's own message this turn.
+    # 3. Whatever the AI itself wrote (least trustworthy - it can garble or truncate this).
+    clean_authoritative = re.sub(r'[^A-Za-z0-9]', '', (authoritative_code or ''))
+    if len(clean_authoritative) >= 7:
+        final_code = clean_authoritative[-7:]
+    elif real_ending:
+        final_code = real_ending
+    elif len(code_alphanum) >= 7:
+        final_code = code_alphanum[-7:]
+    else:
+        return None
+
     return {
-        "code_ending": m.group("code").strip(" -\u2014:"),
+        "code_ending": final_code,
         "price": m.group("price").strip(" -\u2014:"),
         "phone": m.group("phone").strip(" -\u2014:"),
         "package": re.split(r'[\u2014-]', m.group("package"))[0].strip(),
     }
 
+def finalize_alert_slots(parsed, customer_key):
+    """Cross-checks a parsed [ADMIN_ALERT] payload against the deterministic slot tracker
+    (pending_approvals), which is the only source we trust for phone/package. Returns
+    ('ready', parsed) once code+phone+package are all confirmed and admin can be alerted, or
+    ('missing', message) if the customer still needs to supply phone and/or package."""
+    if customer_key in pending_approvals:
+        if not pending_approvals[customer_key].get("phone_confirmed"):
+            pending_approvals[customer_key]["phone"] = None
+        if not pending_approvals[customer_key].get("package_confirmed"):
+            pending_approvals[customer_key]["package"] = None
+            pending_approvals[customer_key]["package_key"] = None
 
-# Deterministic safety-net: pull a real transaction/approval reference straight
-# out of the customer's own message text, independent of whatever the AI
-# decided. If found, this always wins over the AI's CODE_ENDING guess, because
-# an LLM occasionally falls back to the phone number even when a proper
-# reference was clearly given (e.g. "Approval Code: PP260917.1524.T3000820").
-TRANSACTION_REF_PATTERN = re.compile(
-    r'(?:approval\s*code|transaction\s*id|trans(?:action)?\s*ref(?:erence)?|confirmation\s*code|ref(?:erence)?\s*(?:no\.?|number)?)\s*[:#]?\s*'
-    r'([A-Za-z0-9][A-Za-z0-9.\-]{3,})',
-    re.IGNORECASE
-)
+    current_slot = pending_approvals.get(customer_key, parsed)
+    if not current_slot.get("phone") or not current_slot.get("package"):
+        missing = []
+        if not current_slot.get("phone"):
+            missing.append("phone number")
+        if not current_slot.get("package"):
+            missing.append("package")
+        msg = (
+            f"I see your payment code ending **{parsed['code_ending']}**. "
+            f"To proceed, please also provide your **{' and '.join(missing)}**."
+        )
+        return "missing", msg
 
-
-def extract_code_ending_from_text(text):
-    """Return the last 4 alphanumeric characters of a labelled transaction
-    reference found in `text`, or None if no such reference is present."""
-    if not text:
-        return None
-    m = TRANSACTION_REF_PATTERN.search(text)
-    if not m:
-        return None
-    raw = re.sub(r'[^A-Za-z0-9]', '', m.group(1))
-    if len(raw) >= 4:
-        return raw[-4:]
-    return None
-
+    parsed["phone"] = current_slot.get("phone")
+    parsed["package"] = current_slot.get("package")
+    customer_last_code[customer_key] = parsed["code_ending"]
+    return "ready", parsed
 
 def find_target_customer(admin_text):
-    """
-    Deterministically match an admin reply to the customer it's for,
-    instead of asking the AI to guess across every open chat.
-    """
-    digits_in_text = re.findall(r'[A-Za-z0-9]{3,}', admin_text)
+    digits_in_text = re.findall(r'[A-Za-z0-9]{7,}', admin_text)
     for cid, info in pending_approvals.items():
         ending = (info.get("code_ending") or "").strip()
-        if ending and any(ending in d or d in ending for d in digits_in_text):
+        if ending and len(ending) >= 7 and any(ending[-7:] in d or d in ending[-7:] for d in digits_in_text):
             return cid
 
     if len(pending_approvals) == 1:
         return next(iter(pending_approvals))
 
     return None
-
 
 def normalize_package(text):
     if not text:
@@ -425,6 +442,51 @@ def normalize_package(text):
     candidates = [k for k in PACKAGES if t in k or k in t]
     return candidates[0] if len(candidates) == 1 else None
 
+PACKAGE_ALIASES = {re.sub(r'\s+', '', k.upper()): k for k in PACKAGES}
+
+def normalize_package_compact(text):
+    if not text:
+        return None
+    compact = re.sub(r'\s+', '', text.strip().upper())
+    if compact in PACKAGE_ALIASES:
+        return PACKAGE_ALIASES[compact]
+    return normalize_package(text)
+
+# Informal / lenient package matching specifically for raw customer messages. Handles:
+#  - a package name embedded with no whitespace inside a longer message, e.g. the message
+#    starting with "7days: Transfer Confirmation: ..." (normalize_package's substring check
+#    requires the space in "7 DAYS", which "7days" without a space never satisfies)
+#  - informal shorthand like "7d", "24h", "2 days"
+PACKAGE_DURATION_MAP = {
+    ("24", "h"): "24 HOURS LITE",
+    ("2", "d"): "2 DAYS",
+    ("7", "d"): "7 DAYS",
+    ("14", "d"): "14 DAYS PRO",
+    ("30", "d"): "30 DAYS LITE",
+}
+DURATION_RE = re.compile(r'\b(\d{1,2})\s*-?\s*(days?|d|hours?|hrs?|h)\b', re.IGNORECASE)
+
+def extract_package_from_duration(text):
+    if not text:
+        return None
+    m = DURATION_RE.search(text)
+    if not m:
+        return None
+    num = m.group(1)
+    unit = "h" if m.group(2).lower().startswith("h") else "d"
+    return PACKAGE_DURATION_MAP.get((num, unit))
+
+def extract_customer_package(text):
+    if not text:
+        return None
+    pkg = normalize_package(text)
+    if pkg:
+        return pkg
+    compact = re.sub(r'\s+', '', text.strip().upper())
+    compact_matches = {p for alias, p in PACKAGE_ALIASES.items() if alias in compact}
+    if len(compact_matches) == 1:
+        return next(iter(compact_matches))
+    return extract_package_from_duration(text)
 
 def reserve_voucher(package_key):
     if not package_key:
@@ -433,17 +495,13 @@ def reserve_voucher(package_key):
         codes = voucher_inventory.get(package_key)
         if codes:
             return codes.pop(0)
-    # Local stock empty - fall back to MikroTik User Manager over
-    # ZeroTier, filtered by a comment matching the package name.
-    return fetch_um_code(package_key)
-
+    return None
 
 def return_voucher(package_key, code):
-    if not package_key or not code:
+    if not package_key or code is None:
         return
     with _inventory_lock:
         voucher_inventory.setdefault(package_key, []).insert(0, code)
-
 
 def delete_voucher(code, package_key=None):
     with _inventory_lock:
@@ -456,16 +514,22 @@ def delete_voucher(code, package_key=None):
                     return pkg
     return None
 
+ADD_CODE_PATTERN = re.compile(r'^\s*add\s+code\s+(?P<code>\S+)\s+for\s+(?P<package>.+?)\s*$', re.IGNORECASE)
+DELETE_CODE_PATTERN = re.compile(r'^\s*delete\s+code\s+(?P<code>\S+)(?:\s+from\s+(?P<package>.+?))?\s*$', re.IGNORECASE)
+ADD_CODE_SHORT_PATTERN = re.compile(r'^\s*(?P<code>\S+)\s+for\s+(?P<package>.+?)\s*$', re.IGNORECASE)
+DELETE_CODE_SHORT_PATTERN = re.compile(r'^\s*(?P<code>\S+)(?:\s+from\s+(?P<package>.+?))?\s*$', re.IGNORECASE)
+BULK_ADD_ENTRY_PATTERN = re.compile(r'CODE:\s*(?P<code>\S+)[ \t]*\r?\n[ \t]*(?P<pkgline>[^\r\n]+)', re.IGNORECASE)
 
-ADD_CODE_PATTERN = re.compile(
-    r'^\s*add\s+code\s+(?P<code>\S+)\s+for\s+(?P<package>.+?)\s*$',
-    re.IGNORECASE
-)
-
-DELETE_CODE_PATTERN = re.compile(
-    r'^\s*delete\s+code\s+(?P<code>\S+)(?:\s+from\s+(?P<package>.+?))?\s*$',
-    re.IGNORECASE
-)
+def parse_bulk_add_entries(text):
+    entries = []
+    for m in BULK_ADD_ENTRY_PATTERN.finditer(text):
+        code = m.group("code").strip()
+        pkgline = m.group("pkgline").strip()
+        fields = [f.strip() for f in pkgline.split(':') if f.strip()]
+        raw_package = fields[-1] if fields else pkgline
+        pkg_key = normalize_package_compact(raw_package)
+        entries.append((code, pkg_key, raw_package))
+    return entries
 
 YES_WORDS = {"yes", "y", "approve", "approved", "ok", "okay", "confirm", "confirmed"}
 NO_WORDS = {"no", "n", "reject", "rejected", "cancel", "deny", "denied"}
@@ -476,10 +540,26 @@ SERVICE_MESSAGE_PATTERNS = re.compile(
     re.IGNORECASE
 )
 
-
 def is_service_message(text):
     return bool(SERVICE_MESSAGE_PATTERNS.search(text or ""))
 
+def cancel_pending_for_customer(customer_key, reason="left the chat"):
+    info = pending_approvals.pop(customer_key, None)
+    if not info:
+        return False
+    if info.get("proposed_code"):
+        return_voucher(info.get("package_key"), info["proposed_code"])
+
+    label = customer_display.get(customer_key, customer_key)
+    if admin_chat_id:
+        admin_bot.send_message(
+            admin_chat_id,
+            f"⚠️ {label} {reason} before their payment was approved. "
+            "Their pending approval request has been canceled"
+            + (" and the reserved voucher code was returned to stock." if info.get("proposed_code") else ".")
+        )
+    save_state()
+    return True
 
 # ==========================================
 # BOT 1: CUSTOMER BOT HANDLER
@@ -489,6 +569,7 @@ def handle_customer_message(message):
     if message.content_type != 'text' or not (message.text or "").strip():
         return
     if is_service_message(message.text):
+        cancel_pending_for_customer(make_customer_key(message))
         return
 
     customer_key = make_customer_key(message)
@@ -498,8 +579,66 @@ def handle_customer_message(message):
     customer_chat_id[customer_key] = message.chat.id
     customer_display[customer_key] = display_name_for(message)
 
+    # 1. Deterministic Python Pre-Extraction & Slot Management
+    extracted_ref = extract_code_ending_from_text(text)
+    extracted_phone = extract_phone_from_text(text)
+    extracted_pkg = extract_customer_package(text)
+
+    # Make sure conversation memory exists before we possibly inject a system note below.
     if customer_key not in user_memory:
         user_memory[customer_key] = [{"role": "system", "content": system_rules}]
+
+    if extracted_ref:
+        customer_last_code[customer_key] = extracted_ref
+        current_pending = pending_approvals.get(customer_key)
+        # If approval code changed or is new, force reset phone/package slots
+        if not current_pending or current_pending.get("code_ending") != extracted_ref:
+            is_repeat_customer = current_pending is not None
+            pending_approvals[customer_key] = {
+                "code_ending": extracted_ref,
+                "price": "$1.00",
+                "phone": extracted_phone,     # Will be None if not in same msg, forcing prompt
+                "package": extracted_pkg,     # Will be None if not in same msg, forcing prompt
+                "package_key": extracted_pkg,
+                "proposed_code": None,
+                "alert_sent": False,
+                # These flags track whether phone/package were confirmed by OUR extraction
+                # (not by the AI's memory of a previous, unrelated transaction).
+                "phone_confirmed": bool(extracted_phone),
+                "package_confirmed": bool(extracted_pkg),
+            }
+            if is_repeat_customer:
+                # Tell the model explicitly not to reuse stale slot values from earlier
+                # in the chat history for this brand-new payment reference.
+                user_memory[customer_key].append({
+                    "role": "system",
+                    "content": (
+                        "SYSTEM NOTE: The customer just submitted a NEW payment reference, different "
+                        "from any earlier one in this chat. Treat this as a brand-new, separate "
+                        "transaction. Do NOT reuse the phone number or package the customer mentioned "
+                        "earlier in this conversation for this new reference, even though it is visible "
+                        "above in the chat history. You must ask them to (re)confirm both the phone "
+                        "number and the package for THIS payment before producing any [ADMIN_ALERT]."
+                    )
+                })
+        else:
+            if extracted_phone:
+                current_pending["phone"] = extracted_phone
+                current_pending["phone_confirmed"] = True
+            if extracted_pkg:
+                current_pending["package"] = extracted_pkg
+                current_pending["package_key"] = extracted_pkg
+                current_pending["package_confirmed"] = True
+    else:
+        # Update existing slot state with phone or package if sent separately
+        if customer_key in pending_approvals:
+            if extracted_phone:
+                pending_approvals[customer_key]["phone"] = extracted_phone
+                pending_approvals[customer_key]["phone_confirmed"] = True
+            if extracted_pkg:
+                pending_approvals[customer_key]["package"] = extracted_pkg
+                pending_approvals[customer_key]["package_key"] = extracted_pkg
+                pending_approvals[customer_key]["package_confirmed"] = True
 
     user_memory[customer_key].append({"role": "user", "content": text})
     customer_bot.send_chat_action(message.chat.id, 'typing')
@@ -508,35 +647,157 @@ def handle_customer_message(message):
         completion = create_completion(
             user_memory[customer_key],
             model="openai/gpt-oss-120b",
-            temperature=1,
+            temperature=0.3,   
             max_completion_tokens=2048,
             top_p=1
         )
-        ai_reply = completion.choices[0].message.content
+        ai_reply = completion.choices[0].message.content or ""
 
         alerts = re.findall(r'\[ADMIN_ALERT\](.*)', ai_reply, re.IGNORECASE)
         clean_reply = re.sub(r'\[ADMIN_ALERT\].*', '', ai_reply, flags=re.IGNORECASE).strip()
 
+        known_text = "\n".join(
+            m["content"] for m in user_memory[customer_key] if m["role"] == "user"
+        )
+        clean_reply, tampered = strip_fake_approval(clean_reply, known_text)
+        if tampered:
+            print(f"[GUARD] Blocked a fabricated approval/voucher in AI reply for {customer_key}.")
+
+        alerts_to_process = []
+        short_code_detected = False
+
         if alerts:
+            for alert_text in alerts:
+                alert_text = alert_text.strip()
+                authoritative_code = (
+                    (pending_approvals.get(customer_key) or {}).get("code_ending")
+                    or customer_last_code.get(customer_key)
+                )
+                clean_authoritative = re.sub(r'[^A-Za-z0-9]', '', authoritative_code or '')
+                parsed = parse_admin_alert(alert_text, text, authoritative_code=authoritative_code)
+
+                if not parsed and len(clean_authoritative) >= 7:
+                    # The AI's [ADMIN_ALERT] didn't match our strict pipe-delimited format at
+                    # all (missing/garbled fields), but we ALREADY have a verified code for this
+                    # customer's open transaction. Salvage rather than reject as "too short" -
+                    # pull whatever PRICE/PHONE/PACKAGE we can from the alert text, falling back
+                    # to what we've already tracked ourselves.
+                    active = pending_approvals.get(customer_key, {})
+
+                    def _salvage_field(field_name, default=None):
+                        fm = re.search(rf'{field_name}:\s*([^|\n]+)', alert_text, re.IGNORECASE)
+                        return fm.group(1).strip(" -\u2014:") if fm else default
+
+                    parsed = {
+                        "code_ending": clean_authoritative[-7:],
+                        "price": _salvage_field("PRICE", active.get("price") or "$1.00"),
+                        "phone": _salvage_field("PHONE", active.get("phone")),
+                        "package": _salvage_field("PACKAGE", active.get("package")),
+                    }
+
+                if parsed:
+                    status, result = finalize_alert_slots(parsed, customer_key)
+                    if status == "missing":
+                        clean_reply = result
+                        alerts_to_process = []  # Suppress admin alert until slots are filled
+                    else:
+                        alerts_to_process.append((alert_text, result))
+                else:
+                    m = re.search(r'CODE_ENDING:\s*([^|]+)', alert_text, re.IGNORECASE)
+                    if m:
+                        raw_c = re.sub(r'[^A-Za-z0-9]', '', m.group(1))
+                        if raw_c and len(raw_c) < 7:
+                            short_code_detected = True
+                            continue 
+                    
+                    alerts_to_process.append((alert_text, None))
+
+        is_likely_ref_attempt = any(kw in text.lower() for kw in ["pp", "code", "ref", "trans", "sent to"]) or len(re.sub(r'[^0-9]', '', text)) >= 4
+
+        if short_code_detected and is_likely_ref_attempt:
+            clean_reply = "⚠️ The transaction reference provided is too short. A valid approval code must be at least 7 characters long. Please send the FULL exact transaction reference."
+            alerts_to_process = []
+        elif short_code_detected and not is_likely_ref_attempt:
+            alerts_to_process = []
+        elif not clean_reply and (alerts_to_process or tampered):
+            clean_reply = WAIT_MESSAGE if alerts_to_process else NEED_PROOF_MESSAGE
+
+        # GUARD + Templating Enforcement.
+        #
+        # The failure mode we're guarding against is specifically: the model claiming a NEW
+        # payment was JUST received/is now being validated, when nothing genuine happened this
+        # turn (no reference extracted, no admin alert generated). That is fabrication, built
+        # from the model recalling an old exchange in chat history.
+        #
+        # That is NOT the same as the model simply referencing an EXISTING, still-open pending
+        # transaction to ask for missing info ("I see your code ending X, please also confirm
+        # your package") - that's a legitimate, honest continuation, and blocking it breaks
+        # ordinary slot-filling conversations. So a mention of "code ending" is only suspect when
+        # there's no currently-open pending transaction for this customer AND nothing genuine
+        # happened this specific turn.
+        active_pending = pending_approvals.get(customer_key)
+        has_open_pending = bool(active_pending)
+        genuine_receipt_this_turn = bool(extracted_ref) or bool(alerts_to_process)
+        implies_new_receipt = bool(clean_reply) and bool(FAKE_RECEIPT_RE.search(clean_reply))
+        mentions_code_reference = bool(clean_reply) and (
+            "code ending" in clean_reply.lower() or "approval code" in clean_reply.lower()
+        )
+
+        if implies_new_receipt and not genuine_receipt_this_turn:
+            print(f"[GUARD] Blocked a reply falsely claiming a NEW payment was just received for "
+                  f"{customer_key} (no new proof extracted and no admin alert generated this turn).")
+            clean_reply = NO_GENUINE_PROOF_MESSAGE
+        elif mentions_code_reference and not (genuine_receipt_this_turn or has_open_pending):
+            print(f"[GUARD] Blocked a reply referencing a code/approval reference for {customer_key} "
+                  "with no open pending transaction and no genuine proof this turn.")
+            clean_reply = NO_GENUINE_PROOF_MESSAGE
+        elif mentions_code_reference:
+            # Genuine case (fresh this turn, or honestly continuing an already-open transaction):
+            # enforce Python's exact verified code value rather than whatever the model wrote.
+            true_ending = (active_pending or {}).get("code_ending") or customer_last_code.get(customer_key)
+            if true_ending:
+                clean_reply = re.sub(
+                    r'(Approval Code ending\s*\**\s*)[A-Za-z0-9]+(\s*\**)',
+                    rf'\1**{true_ending}**\2',
+                    clean_reply,
+                    flags=re.IGNORECASE
+                )
+
+        duplicate_notice = False
+
+        if alerts_to_process:
             if admin_chat_id:
-                for alert in alerts:
-                    alert_text = alert.strip()
-                    parsed = parse_admin_alert(alert_text)
+                for alert_text, parsed in alerts_to_process:
+                    label = customer_display.get(customer_key, str(customer_key))
+
                     if parsed:
-                        # Deterministic override: if the customer's own message
-                        # contains a labelled transaction/approval reference,
-                        # trust that over whatever the AI put in CODE_ENDING.
-                        real_ending = extract_code_ending_from_text(text)
-                        if real_ending:
-                            parsed["code_ending"] = real_ending
+                        fp = payment_fingerprint(parsed)
+
+                        if fp and fp in used_payment_refs:
+                            duplicate_notice = True
+                            admin_bot.send_message(
+                                admin_chat_id,
+                                f"⚠️ DUPLICATE payment proof from {label} "
+                                f"(code ending {parsed['code_ending']}, {parsed['price']}, phone {parsed['phone']}). "
+                                "A voucher was already issued for this proof, so no new request was created."
+                            )
+                            continue
+
+                        existing = pending_approvals.get(customer_key, {})
+                        if existing.get("alert_sent"):
+                            continue # Already alerted
+
+                        if existing.get("proposed_code"):
+                            return_voucher(existing.get("package_key"), existing["proposed_code"])
 
                         pending_approvals[customer_key] = parsed
                         pkg_key = normalize_package(parsed['package'])
                         reserved_code = reserve_voucher(pkg_key)
                         pending_approvals[customer_key]["package_key"] = pkg_key
                         pending_approvals[customer_key]["proposed_code"] = reserved_code
-
-                        label = customer_display.get(customer_key, str(customer_key))
+                        pending_approvals[customer_key]["alert_sent"] = True
+                        pending_approvals[customer_key]["phone_confirmed"] = True
+                        pending_approvals[customer_key]["package_confirmed"] = True
 
                         if reserved_code:
                             admin_msg = (
@@ -560,19 +821,28 @@ def handle_customer_message(message):
                                 f"No stored code for this package. Reply with a new voucher code to approve, or 'no' to reject."
                             )
                     else:
-                        label = customer_display.get(customer_key, str(customer_key))
+                        if customer_key in pending_approvals and pending_approvals[customer_key].get("alert_sent"):
+                            continue
                         pending_approvals[customer_key] = {
                             "code_ending": extract_code_ending_from_text(text) or "",
                             "price": "", "phone": "", "package": "",
-                            "package_key": None, "proposed_code": None
+                            "package_key": None, "proposed_code": None, "alert_sent": True
                         }
                         admin_msg = f"🔔 ADMIN ALERT (Customer: {label}):\n{alert_text}"
                     admin_bot.send_message(admin_chat_id, admin_msg)
             else:
                 clean_reply += "\n\n⚠️ SYSTEM NOTIFICATION: The Admin Bot is currently unlinked. (Admin: Please send /start to the Admin bot to reconnect routing)."
 
+        if duplicate_notice:
+            clean_reply = DUPLICATE_MESSAGE
+
         if clean_reply:
-            user_memory[customer_key].append({"role": "assistant", "content": ai_reply})
+            clean_reply = ensure_closing_warning(clean_reply)
+            history_entry = clean_reply
+            
+            if alerts_to_process and not duplicate_notice:
+                history_entry += "".join(f"\n[ADMIN_ALERT]{a[0]}" for a in alerts_to_process)
+            user_memory[customer_key].append({"role": "assistant", "content": history_entry})
             customer_bot.reply_to(message, clean_reply)
 
         if len(user_memory[customer_key]) > 15:
@@ -583,10 +853,29 @@ def handle_customer_message(message):
     except Exception as e:
         customer_bot.reply_to(message, f"Error processing request: {str(e)}")
 
+@customer_bot.message_handler(content_types=['left_chat_member'])
+def handle_customer_left(message):
+    left_user = message.left_chat_member
+    if not left_user:
+        return
+    customer_key = f"{message.chat.id}:{left_user.id}"
+    cancel_pending_for_customer(customer_key)
 
 # ==========================================
 # BOT 2: ADMIN BOT HANDLER
 # ==========================================
+INVISIBLE_CHARS_RE = re.compile(r'[\u200e\u200f\u200b\u200c\u200d\u2060\ufeff\u202a-\u202e]')
+
+STOCK_COMMANDS = {'stock', '/stock', 'inventory', '/inventory'}
+STOCK_FULL_COMMANDS = {
+    'stock full', 'stock detail', 'list codes',
+    '/stockfull', '/stockdetail', '/orstockdetail', '/listcodes', '/codes',
+}
+
+def clean_admin_text(raw):
+    text = INVISIBLE_CHARS_RE.sub('', raw or '').strip()
+    return re.sub(r'^(/\w+)@\w+', r'\1', text)
+
 @admin_bot.message_handler(func=lambda message: True)
 def handle_admin_message(message):
     global admin_chat_id
@@ -597,20 +886,87 @@ def handle_admin_message(message):
         return
 
     if not is_authorized_admin(message):
-        # Fail closed: unrecognized user gets no information about how the
-        # system works and cannot link, approve, reject, or touch inventory.
         admin_bot.reply_to(message, "🚫 You are not authorized to use this bot.")
         return
 
     admin_chat_id = message.chat.id
-    text = message.text.strip()
+    text = clean_admin_text(message.text)
+    if not text:
+        return
 
     if text.lower() in ['/start', 'hello', 'hi', 'link']:
         admin_bot.reply_to(message, f"✅ Admin Link Active! (Your ID: {admin_chat_id})\nReady to receive and route vouchers.")
         save_state()
         return
 
-    if text.strip().lower() in ['stock', '/stock', 'inventory', '/inventory']:
+    if text.lower() in ['/addcode', 'addcode']:
+        with _admin_state_lock:
+            admin_awaiting[admin_chat_id] = 'add_code'
+        admin_bot.reply_to(
+            message,
+            "✏️ Type a code to be added, followed by its package:\n<code> for <package>\n\nExample: 6786gfr for 7 DAYS"
+        )
+        return
+
+    if text.lower() in ['/deletecode', 'deletecode']:
+        with _admin_state_lock:
+            admin_awaiting[admin_chat_id] = 'delete_code'
+        admin_bot.reply_to(
+            message,
+            "✏️ Type a code to be deleted.\nOptionally add the package: <code> from <package>"
+        )
+        return
+
+    awaiting = None
+    with _admin_state_lock:
+        if text.startswith('/'):
+            admin_awaiting.pop(admin_chat_id, None)
+        else:
+            awaiting = admin_awaiting.pop(admin_chat_id, None)
+
+    if awaiting == 'add_code':
+        m = ADD_CODE_SHORT_PATTERN.match(text)
+        if not m:
+            admin_bot.reply_to(
+                message,
+                "⚠️ Didn't recognize that format. Please send it as:\n<code> for <package>"
+            )
+            return
+        code = m.group("code").strip()
+        pkg_input = m.group("package").strip()
+        pkg_key = normalize_package(pkg_input)
+        if pkg_key:
+            with _inventory_lock:
+                voucher_inventory.setdefault(pkg_key, []).append(code)
+            admin_bot.reply_to(
+                message,
+                f"✅ Added to stock:\n{code} → {pkg_key} ({PACKAGES[pkg_key]['price']}, {PACKAGES[pkg_key]['data']})"
+            )
+            save_state()
+        else:
+            admin_bot.reply_to(
+                message,
+                f"⚠️ Could not match package '{pkg_input}'.\n\nKnown packages: " + ", ".join(PACKAGES.keys())
+            )
+        return
+
+    if awaiting == 'delete_code':
+        m = DELETE_CODE_SHORT_PATTERN.match(text)
+        if not m:
+            admin_bot.reply_to(message, "⚠️ Didn't recognize that. Please send just the code, e.g.: A1B2C3")
+            return
+        code = m.group("code").strip()
+        pkg_input = m.group("package")
+        pkg_key = normalize_package(pkg_input.strip()) if pkg_input else None
+        found_pkg = delete_voucher(code, pkg_key)
+        if found_pkg:
+            admin_bot.reply_to(message, f"🗑️ Removed from stock:\n{code} (was in {found_pkg})")
+            save_state()
+        else:
+            admin_bot.reply_to(message, f"⚠️ Not found in stock (already used, wrong package, or typo): {code}")
+        return
+
+    if text.lower() in STOCK_COMMANDS:
         lines = [
             f"- {pkg} ({info['price']}, {info['data']}): {len(voucher_inventory.get(pkg, []))} code(s)"
             for pkg, info in PACKAGES.items()
@@ -618,11 +974,11 @@ def handle_admin_message(message):
         admin_bot.reply_to(
             message,
             "📦 Voucher stock:\n" + "\n".join(lines) +
-            "\n\nSend 'stock full' to see the actual codes."
+            "\n\nSend /stockfull to see the actual codes."
         )
         return
 
-    if text.strip().lower() in ['stock full', 'stock detail', 'list codes', '/codes']:
+    if text.lower() in STOCK_FULL_COMMANDS:
         lines = []
         for pkg, info in PACKAGES.items():
             codes = voucher_inventory.get(pkg, [])
@@ -631,60 +987,27 @@ def handle_admin_message(message):
         admin_bot.reply_to(message, "📦 Voucher stock (detailed):\n" + "\n".join(lines))
         return
 
-    # ------------------------------------------------------------------
-    # MikroTik diagnostic commands - read-only, never reserve/re-tag a
-    # voucher, so these can be run as many times as needed while debugging.
-    # ------------------------------------------------------------------
-    if text.strip().lower() in ['mikrotik test', 'test mikrotik', 'router test', 'test router']:
-        try:
-            api = _mikrotik_connect()
-        except Exception as e:
-            admin_bot.reply_to(message, f"❌ MikroTik connection failed: {e}")
-            return
-        try:
-            users = list(api.path("user-manager", "user"))
-            total = len(users)
-            comment_counts = {}
-            for u in users:
-                c = (u.get("comment") or "").strip()
-                if c:
-                    comment_counts[c] = comment_counts.get(c, 0) + 1
-            summary = "\n".join(f"  - '{c}': {n}" for c, n in sorted(comment_counts.items())) or "  (no comments set on any user)"
-            admin_bot.reply_to(
-                message,
-                f"✅ MikroTik API reachable.\n"
-                f"Host: {MIKROTIK_HOST}:{MIKROTIK_API_PORT}\n"
-                f"Total user-manager users: {total}\n"
-                f"By comment:\n{summary}"
-            )
-        except Exception as e:
-            admin_bot.reply_to(message, f"⚠️ Connected, but the query failed: {e}")
-        finally:
-            try:
-                api.close()
-            except Exception:
-                pass
-        return
+    bulk_add_entries = parse_bulk_add_entries(text)
+    if bulk_add_entries:
+        added, failed = [], []
+        for code, pkg_key, raw_package in bulk_add_entries:
+            if pkg_key:
+                with _inventory_lock:
+                    voucher_inventory.setdefault(pkg_key, []).append(code)
+                added.append(f"{code} → {pkg_key} ({PACKAGES[pkg_key]['price']}, {PACKAGES[pkg_key]['data']})")
+            else:
+                failed.append(f"{code} (unrecognized package '{raw_package}')")
 
-    if text.strip().lower().startswith('mikrotik check '):
-        comment = text.strip()[len('mikrotik check '):].strip()
-        try:
-            api = _mikrotik_connect()
-            users = list(api.path("user-manager", "user"))
-            match = next((u for u in users if u.get("comment", "") == comment), None)
-            api.close()
-        except Exception as e:
-            admin_bot.reply_to(message, f"❌ MikroTik connection/query failed: {e}")
-            return
-        if match:
-            admin_bot.reply_to(
-                message,
-                f"✅ Found an unused voucher with comment '{comment}':\n"
-                f"Username: {match.get('name') or match.get('username')}\n"
-                "(not reserved — this was just a lookup, run the real approval flow to consume it)"
+        reply_parts = []
+        if added:
+            reply_parts.append(f"✅ Added {len(added)} code(s) to stock:\n" + "\n".join(added))
+        if failed:
+            reply_parts.append(
+                "⚠️ Could not match package for:\n" + "\n".join(failed) +
+                "\n\nKnown packages: " + ", ".join(PACKAGES.keys())
             )
-        else:
-            admin_bot.reply_to(message, f"⚠️ No voucher found with comment exactly '{comment}'.")
+        admin_bot.reply_to(message, "\n\n".join(reply_parts))
+        save_state()
         return
 
     delete_matches = [m for m in (DELETE_CODE_PATTERN.match(line) for line in text.splitlines()) if m]
@@ -737,6 +1060,14 @@ def handle_admin_message(message):
         save_state()
         return
 
+    if text.startswith('/'):
+        admin_bot.reply_to(
+            message,
+            "⚠️ Unknown command. Available:\n"
+            "/stock, /stockfull, /stockdetail, /listcodes, /codes, /addcode, /deletecode"
+        )
+        return
+
     target_key = find_target_customer(text)
 
     if target_key is None:
@@ -761,6 +1092,8 @@ def handle_admin_message(message):
     target_label = customer_display.get(target_key, target_key)
 
     if target_chat_id is None:
+        if info.get("proposed_code"):
+            return_voucher(info.get("package_key"), info["proposed_code"])
         admin_bot.reply_to(message, f"⚠️ Lost track of chat for {target_label}; they'll need to message again.")
         pending_approvals.pop(target_key, None)
         save_state()
@@ -782,13 +1115,13 @@ def handle_admin_message(message):
                 f"✅ Your payment has been approved!\n\n"
                 f"Package: {package}\n"
                 f"Voucher code: {code}\n\n"
-                "Do not close this current chat, otherwise you might not receive your login code, "
-                "token, or password because the chat ID changes."
+                + CLOSING_WARNING
             )
             history = user_memory.setdefault(target_key, [{"role": "system", "content": system_rules}])
-            history.append({"role": "assistant", "content": voucher_message})
+            note_voucher_delivered(history, package)
             send_to_customer(voucher_message)
 
+            mark_payment_used(info)
             admin_bot.reply_to(message, f"✅ Delivered stored code '{code}' to {target_label} instantly.")
             pending_approvals.pop(target_key, None)
             save_state()
@@ -820,8 +1153,7 @@ def handle_admin_message(message):
         rejection_message = (
             "❌ Unfortunately we could not verify your payment. "
             "Please double-check your proof of payment and try again, or contact support.\n\n"
-            "Do not close this current chat, otherwise you might not receive your login code, "
-            "token, or password because the chat ID changes."
+            + CLOSING_WARNING
         )
         history.append({"role": "assistant", "content": rejection_message})
         send_to_customer(rejection_message)
@@ -832,17 +1164,26 @@ def handle_admin_message(message):
         return
 
     code = text.strip()
+
+    if len(code.split()) != 1:
+        admin_bot.reply_to(
+            message,
+            f"⚠️ That doesn't look like a single voucher code, so I did NOT send it to {target_label}. "
+            "Send only the code (no spaces), or 'no' to reject."
+        )
+        return
+
     package = info.get("package") or "your package"
     voucher_message = (
         f"✅ Your payment has been approved!\n\n"
         f"Package: {package}\n"
         f"Voucher code: {code}\n\n"
-        "Do not close this current chat, otherwise you might not receive your login code, "
-        "token, or password because the chat ID changes."
+        + CLOSING_WARNING
     )
-    history.append({"role": "assistant", "content": voucher_message})
+    note_voucher_delivered(history, package)
     send_to_customer(voucher_message)
 
+    mark_payment_used(info)
     admin_bot.reply_to(message, f"✅ Delivered code '{code}' to {target_label} instantly.")
     pending_approvals.pop(target_key, None)
     save_state()
@@ -858,14 +1199,44 @@ def home():
     return "Dual-Bot System Running!"
 
 def run_customer_bot():
-    customer_bot.infinity_polling()
+    # Watchdog: pyTelegramBotAPI's infinity_polling() is *supposed* to retry forever on any
+    # exception, but a 409 Conflict from getUpdates (e.g. during a Render rolling deploy, where
+    # the old instance briefly overlaps with the new one) can escape that internal retry and
+    # kill this thread silently - Flask keeps answering health checks, so the service looks
+    # "up" on Render, but nothing is actually polling Telegram anymore. This outer loop makes
+    # sure polling always restarts instead of dying quietly.
+    while True:
+        try:
+            customer_bot.remove_webhook()  # clears any stray webhook that could also cause 409s
+        except Exception as e:
+            print(f"[Customer Bot] remove_webhook failed (continuing anyway): {e}")
+        try:
+            print("[Customer Bot] Starting polling...")
+            customer_bot.infinity_polling(timeout=20, long_polling_timeout=20)
+        except Exception as e:
+            print(f"[Customer Bot] Polling crashed: {e}")
+        print("[Customer Bot] Polling stopped/crashed - restarting in 5s...")
+        time.sleep(5)
 
 def run_admin_bot():
-    admin_bot.infinity_polling()
+    while True:
+        try:
+            admin_bot.remove_webhook()
+        except Exception as e:
+            print(f"[Admin Bot] remove_webhook failed (continuing anyway): {e}")
+        try:
+            print("[Admin Bot] Starting polling...")
+            admin_bot.infinity_polling(timeout=20, long_polling_timeout=20)
+        except Exception as e:
+            print(f"[Admin Bot] Polling crashed: {e}")
+        print("[Admin Bot] Polling stopped/crashed - restarting in 5s...")
+        time.sleep(5)
 
 if __name__ == "__main__":
+    import sys
+    print("[VERSION] splash_bot.py — build with lenient package matching + open-pending guard fix", flush=True)
     load_state()
-    print(f"[Groq] Loaded {len(groq_clients)} API key(s) for rotation/fallback.")
+    print(f"[Groq] Loaded {len(groq_clients)} API key(s) for rotation/fallback.", flush=True)
     Thread(target=run_customer_bot).start()
     Thread(target=run_admin_bot).start()
     port = int(os.environ.get('PORT', 5000))
