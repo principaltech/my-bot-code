@@ -265,13 +265,43 @@ You are an automated customer care AI assistant for Splash Internet. You MUST fo
    - If you see a SYSTEM NOTE telling you a new payment reference was submitted, treat it as a completely separate, brand-new transaction. Do NOT reuse a phone number or package mentioned earlier in this chat for that new reference. Ask the customer to (re)confirm both before producing any [ADMIN_ALERT].
 11. NEVER FABRICATE A "PAYMENT RECEIVED" REPLY:
    - Only tell the customer their payment was received / to wait 30 seconds if THIS message actually contains a new, valid transaction reference. If the customer's latest message is something else (a package choice, "resend", a greeting, etc.) with no reference in it, do NOT repeat or imply an earlier payment confirmation from chat history - ask them for the actual proof of payment instead.
+12. ONE-MESSAGE FORMAT (ALWAYS RECOMMEND THIS):
+   - Whenever the customer wants to buy, asks how to pay, or has not yet given all three details, recommend that they send EVERYTHING in ONE message, using exactly this format:
+     Phone number:
+     Package:
+     Paste Full Proof of payment:
+   - Tell them to paste the ENTIRE EcoCash confirmation message (the whole "Transfer Confirmation: ... Approval Code: ... New balance: ..." text), NOT just the last digits of the approval code. The backend reads the full approval code and the amount from it and compares them with our records.
+   - If the customer sends only part of the code, politely ask them to paste the FULL proof of payment.
+   - If some details are still missing, ask only for the missing ones and show the same format.
 """
 
 WAIT_MESSAGE = "Thank you, we have received your payment proof. Please wait about 30 seconds while we validate the payment."
-NEED_PROOF_MESSAGE = ("Please send your phone number, the package you want, and your proof of payment "
-                      "(the EcoCash confirmation message or the exact transaction reference).")
+ONE_MESSAGE_FORMAT = "Phone number:\nPackage:\nPaste Full Proof of payment:"
+NEED_PROOF_MESSAGE = (
+    "Please send everything in ONE message, using this format:\n\n"
+    + ONE_MESSAGE_FORMAT +
+    "\n\nPaste the ENTIRE EcoCash confirmation message (from \"Transfer Confirmation\" to the end), "
+    "not just part of the approval code."
+)
+NEED_FULL_PROOF_MESSAGE = (
+    "I received a code, but I need the FULL proof of payment. Please paste the ENTIRE EcoCash "
+    "confirmation message (from \"Transfer Confirmation\" to the end), not just part of the approval code.\n\n"
+    "Use this format:\n\n"
+    + ONE_MESSAGE_FORMAT
+)
 DUPLICATE_MESSAGE = ("This payment proof has already been processed. If you did not receive your voucher, "
                      "please scroll up in this chat to find it, or contact support.")
+
+def build_welcome_message():
+    lines = [f"- {pkg}: {info['price']} = {info['data']}" for pkg, info in PACKAGES.items()]
+    return (
+        "👋 Welcome to Splash Internet!\n\n"
+        "Packages:\n" + "\n".join(lines) + "\n\n"
+        "Pay via EcoCash to 0776248396, then send EVERYTHING in ONE message, using this format:\n\n"
+        + ONE_MESSAGE_FORMAT +
+        "\n\nPaste the ENTIRE EcoCash confirmation message (from \"Transfer Confirmation\" to the end), "
+        "not just part of the approval code."
+    )
 
 PHONE_PATTERN = re.compile(r'\b(07\d{8}|\+?2637\d{8})\b')
 
@@ -298,9 +328,10 @@ FAKE_RECEIPT_RE = re.compile(
     re.IGNORECASE | re.DOTALL
 )
 NO_GENUINE_PROOF_MESSAGE = (
-    "I don't see a new payment proof or transaction reference in your last message. "
-    "If you already paid, please resend the full EcoCash confirmation or transaction reference "
-    "so we can process it."
+    "I don't see a new payment proof in your last message. If you already paid, please send "
+    "everything in ONE message, using this format:\n\n"
+    + ONE_MESSAGE_FORMAT +
+    "\n\nPaste the ENTIRE EcoCash confirmation message, not just part of the approval code."
 )
 
 def strip_fake_approval(reply, known_text=""):
@@ -359,14 +390,27 @@ TRANSACTION_REF_PATTERN = re.compile(
     re.IGNORECASE
 )
 
+# Fallback for the one-message format when the customer types ONLY the code, e.g.
+#   Proof of payment: PP260919.2324.T3345746      or      Proof of payment: 3345746
+# The value must be a single token alone on its line (so "Proof of payment: Transfer
+# Confirmation: ..." is never mistaken for a reference) and contain at least 4 digits.
+PROOF_FIELD_REF_PATTERN = re.compile(
+    r'proof\s*of\s*payment\s*[:\-]\s*([A-Za-z0-9][A-Za-z0-9.\-]{6,})[ \t]*$',
+    re.IGNORECASE | re.MULTILINE
+)
+
 def extract_code_ending_from_text(text):
+    """Returns ONLY the last 7 alphanumeric characters of the approval code - that is the
+    only part of a reference the whole system ever uses."""
     if not text:
         return None
     m = TRANSACTION_REF_PATTERN.search(text)
     if not m:
+        m = PROOF_FIELD_REF_PATTERN.search(text)
+    if not m:
         return None
     raw = re.sub(r'[^A-Za-z0-9]', '', m.group(1))
-    if len(raw) >= 7:
+    if len(raw) >= 7 and sum(ch.isdigit() for ch in raw) >= 4:
         return raw[-7:]
     return None
 
@@ -425,9 +469,13 @@ def finalize_alert_slots(parsed, customer_key):
             missing.append("phone number")
         if not current_slot.get("package"):
             missing.append("package")
+        field_lines = "\n".join(
+            "Phone number:" if item == "phone number" else "Package:" for item in missing
+        )
         msg = (
             f"I see your payment code ending **{parsed['code_ending']}**. "
-            f"To proceed, please also provide your **{' and '.join(missing)}**."
+            f"To proceed, please also provide your **{' and '.join(missing)}**.\n\n"
+            f"Reply in this format:\n{field_lines}"
         )
         return "missing", msg
 
@@ -539,6 +587,31 @@ def extract_customer_package(text):
         return pkg
     return extract_package_from_price(text)
 
+def _field_value(text, *labels):
+    """Value of a 'Label: value' line (used for the Phone number / Package / ... format)."""
+    for label in labels:
+        m = re.search(rf'^[ \t]*{label}[ \t]*[:\-][ \t]*(.+)$', text or "", re.IGNORECASE | re.MULTILINE)
+        if m:
+            return m.group(1).strip()
+    return None
+
+def extract_phone_from_message(text):
+    val = _field_value(text, r'phone(?:\s*(?:number|no\.?))?', r'mobile(?:\s*number)?', r'whatsapp')
+    if val:
+        # tolerate "0771 234 567", "077-123-4567", "+263 77 123 4567"
+        phone = extract_phone_from_text(re.sub(r'[\s\-().]', '', val))
+        if phone:
+            return phone
+    return extract_phone_from_text(text)
+
+def extract_package_from_message(text):
+    val = _field_value(text, r'package', r'bundle', r'plan')
+    if val:
+        pkg = extract_customer_package(val)
+        if pkg:
+            return pkg
+    return extract_customer_package(text)
+
 def reserve_voucher(package_key):
     if not package_key:
         return None
@@ -621,12 +694,14 @@ def cancel_pending_for_customer(customer_key, reason="left the chat"):
 #         Transfer Confirmation: USD 1.00 from MICHAEL KUSUBA.
 #         Approval Code: PP260919.2324.T3345746
 #         New balance: USD 15.63.
-#      The bot stores: amount (1.00), full reference, and its last 7 chars.
-#   2. When a customer sends proof, the bot auto-approves ONLY if
-#         - last 7 chars of the approval code match a registered proof, AND
-#         - the amount they sent equals the registered amount, AND
-#         - (if they sent the full reference) the full reference matches, AND
-#         - the package's price equals the paid amount, AND
+#      The bot stores the amount (1.00) and the FULL approval code
+#      (PP260919.2324.T3345746). Its last 7 characters (3345746) are the lookup key
+#      shown in messages. The sender name is just a label.
+#   2. The customer must paste the FULL proof of payment. The bot auto-approves ONLY if
+#         - the last 7 chars of their approval code find a registered proof, AND
+#         - their FULL approval code equals the stored one, AND
+#         - the amount in their proof equals the registered amount, AND
+#         - the chosen package costs exactly that amount, AND
 #         - a stocked voucher exists for that package.
 #      Anything else falls through to the normal AI + admin YES/NO flow.
 #   3. After the voucher is delivered, the registered proof is DELETED and
@@ -638,7 +713,7 @@ AUTO_APPROVE_ENABLED = os.environ.get("AUTO_APPROVE_ENABLED", "1") != "0"
 # before auto-sending (by default price + reference + package are enough).
 AUTO_APPROVE_REQUIRE_PHONE = os.environ.get("AUTO_APPROVE_REQUIRE_PHONE", "0") == "1"
 
-# fingerprint (last 7 alphanumerics, lowercase) -> {"amount", "full_ref", "sender", "registered_at"}
+# fingerprint (last 7 alphanumerics, lowercase) -> {"amount", "full_ref", "ref_ending", "sender", "registered_at"}
 registered_proofs = {}
 _proofs_lock = Lock()
 
@@ -655,7 +730,7 @@ def proof_fingerprint(ref):
 
 
 def extract_full_reference_from_text(text):
-    """Full approval code with punctuation stripped, e.g. 'PP2609192324T3345746'."""
+    """The FULL approval code with punctuation stripped, e.g. 'PP2609191817T1705184'."""
     if not text:
         return None
     m = TRANSACTION_REF_PATTERN.search(text)
@@ -663,6 +738,22 @@ def extract_full_reference_from_text(text):
         return None
     raw = re.sub(r'[^A-Za-z0-9]', '', m.group(1))
     return raw if len(raw) >= 7 else None
+
+
+def proof_is_incomplete(pending, text):
+    """True when the customer gave a code but NOT the full proof of payment.
+    A full proof = the FULL approval code plus either a USD amount or the confirmation text
+    itself (so a proof paid in another currency, e.g. 'ZWG 25.00', is still accepted and goes
+    to the admin for a manual decision instead of being asked for again forever)."""
+    now_ref = normalize_ref(extract_full_reference_from_text(text))
+    has_amount_or_heading = bool(extract_payment_amount(text)) or bool(
+        re.search(r'confirmation', text or "", re.IGNORECASE))
+    if len(now_ref) > 7 and has_amount_or_heading:
+        return False
+    # ...or the full proof was already pasted earlier in this same transaction.
+    earlier_ok = (len(normalize_ref((pending or {}).get("claimed_ref"))) > 7
+                  and bool((pending or {}).get("claimed_amount")))
+    return not earlier_ok
 
 
 def extract_payment_amount(text):
@@ -681,6 +772,13 @@ def extract_payment_amount(text):
     return None
 
 
+def _party_text(p):
+    """' from NAME' / ' to NAME' display label for a registered proof (or '')."""
+    if not p.get("sender"):
+        return ""
+    return f" {p.get('direction') or 'from'} {p['sender']}"
+
+
 def parse_proof_blocks(text):
     """Parses one OR several pasted confirmations (split on 'Transfer Confirmation')."""
     proofs = []
@@ -692,11 +790,15 @@ def parse_proof_blocks(text):
         amount = extract_payment_amount(block)
         if not full_ref or not amount:
             continue
-        sender_m = re.search(r'\bfrom\s+([^\n.]+)', block, re.IGNORECASE)
+        # The receiver's SMS says "USD 1.00 from NAME", the sender's says "USD 0.50 sent to NAME".
+        # Either way the name is just a display label - it is never used for matching.
+        party_m = re.search(r'\b(from|sent\s+to)\s+([^\n.]+)', block, re.IGNORECASE)
         proofs.append({
             "amount": amount,
-            "full_ref": full_ref,
-            "sender": sender_m.group(1).strip() if sender_m else "",
+            "full_ref": full_ref,                        # compared in full against the customer's proof
+            "ref_ending": normalize_ref(full_ref)[-7:],  # lookup key / what admin messages show
+            "sender": party_m.group(2).strip() if party_m else "",
+            "direction": "to" if (party_m and party_m.group(1).lower().startswith("sent")) else "from",
             "registered_at": time.time(),
         })
     return proofs
@@ -719,17 +821,24 @@ def try_auto_approve(customer_key):
     if not proof:
         return False  # admin never registered this payment -> manual flow
 
-    # --- verification: price ---------------------------------------------
-    if info.get("claimed_amount") != proof["amount"]:
-        print(f"[AUTO] {customer_key}: amount mismatch (claimed {info.get('claimed_amount')} vs "
-              f"registered {proof['amount']}) - manual flow.")
+    # --- verification: the customer must have pasted the FULL proof of payment ---
+    claimed_ref = normalize_ref(info.get("claimed_ref"))
+    claimed_amount = info.get("claimed_amount")
+    if len(claimed_ref) <= 7 or not claimed_amount:
+        return False  # partial proof (e.g. only the last digits) is never auto-approved
+
+    # --- verification: the FULL approval code must equal the stored one ---------
+    # (the last 7 characters are only used above to find the stored record)
+    reg_ref = normalize_ref(proof.get("full_ref"))
+    if reg_ref and claimed_ref != reg_ref:
+        print(f"[AUTO] {customer_key}: approval code mismatch (same last 7, different full code) "
+              "- manual flow.")
         return False
 
-    # --- verification: full reference, when the customer supplied it -------
-    claimed_ref = normalize_ref(info.get("claimed_ref"))
-    reg_ref = normalize_ref(proof.get("full_ref"))
-    if len(claimed_ref) > 7 and len(reg_ref) > 7 and claimed_ref != reg_ref:
-        print(f"[AUTO] {customer_key}: full reference mismatch - manual flow.")
+    # --- verification: price ------------------------------------------------
+    if claimed_amount != proof["amount"]:
+        print(f"[AUTO] {customer_key}: amount mismatch (claimed {claimed_amount} vs "
+              f"registered {proof['amount']}) - manual flow.")
         return False
 
     if AUTO_APPROVE_REQUIRE_PHONE and not info.get("phone"):
@@ -802,7 +911,7 @@ def try_auto_approve(customer_key):
                 f"🤖 AUTO-APPROVED\n"
                 f"Customer: {label}\n"
                 f"Ref ending: {fp}  |  Paid: ${proof['amount']}"
-                + (f" (from {proof['sender']})" if proof.get("sender") else "") + "\n"
+                + (f" ({_party_text(proof).strip()})" if proof.get("sender") else "") + "\n"
                 f"Package: {pkg_key}\n"
                 f"Voucher sent: {code}\n"
                 f"The registered proof was removed from memory."
@@ -822,7 +931,7 @@ def register_proofs_from_admin(text):
                 "(e.g. USD 1.00) and an 'Approval Code'. Please paste the full confirmation as received.")
     lines = []
     for p in proofs:
-        fp = proof_fingerprint(p["full_ref"])
+        fp = proof_fingerprint(p["ref_ending"])
         if fp in used_payment_refs:
             lines.append(f"⚠️ Ref ending {fp} was already redeemed - NOT registered.")
             continue
@@ -836,7 +945,7 @@ def register_proofs_from_admin(text):
             if proof_fingerprint(cinfo.get("code_ending")) == fp and try_auto_approve(ckey):
                 served.append(customer_display.get(ckey, str(ckey)))
 
-        who = f" from {p['sender']}" if p["sender"] else ""
+        who = _party_text(p)
         line = f"✅ {'Updated' if replaced else 'Registered'}: ${p['amount']}{who}, ref ending {fp}."
         if served:
             line += f" A waiting customer ({', '.join(served)}) was auto-approved right away."
@@ -851,7 +960,7 @@ def list_proofs_text():
         items = list(registered_proofs.items())
     if not items:
         return "📭 No registered proofs waiting."
-    lines = [f"- ref ending {fp}: ${p['amount']}" + (f" from {p['sender']}" if p.get("sender") else "")
+    lines = [f"- ref ending {fp}: ${p['amount']}" + _party_text(p)
              for fp, p in items]
     return "🧾 Registered proofs (auto-approve on match):\n" + "\n".join(lines) + \
            "\n\nRemove one with /delproof <last 7 chars of the approval code>"
@@ -1072,8 +1181,8 @@ def handle_customer_message(message):
 
     # 1. Deterministic Python Pre-Extraction & Slot Management
     extracted_ref = extract_code_ending_from_text(text)
-    extracted_phone = extract_phone_from_text(text)
-    extracted_pkg = extract_customer_package(text)
+    extracted_phone = extract_phone_from_message(text)
+    extracted_pkg = extract_package_from_message(text)
 
     # Make sure conversation memory exists before we possibly inject a system note below.
     if customer_key not in user_memory:
@@ -1106,6 +1215,14 @@ def handle_customer_message(message):
             save_state()
             return
 
+    # Deterministic welcome: always shows the one-message format (no AI involved).
+    if text.strip().lower() in ("/start", "start"):
+        welcome = ensure_closing_warning(build_welcome_message())
+        user_memory[customer_key].append({"role": "assistant", "content": welcome})
+        customer_bot.reply_to(message, welcome)
+        save_state()
+        return
+
     if extracted_ref:
         customer_last_code[customer_key] = extracted_ref
         current_pending = pending_approvals.get(customer_key)
@@ -1124,8 +1241,9 @@ def handle_customer_message(message):
                 # (not by the AI's memory of a previous, unrelated transaction).
                 "phone_confirmed": bool(extracted_phone),
                 "package_confirmed": bool(extracted_pkg),
-                # What the CUSTOMER claims they paid / the full reference they quoted.
-                # Used to verify against an admin-registered proof for auto-approval.
+                # The amount and FULL approval code shown in the CUSTOMER's pasted proof -
+                # checked against the admin-registered proof for auto-approval. (The last 7
+                # characters, code_ending, are what identifies a payment everywhere else.)
                 "claimed_amount": extract_payment_amount(text),
                 "claimed_ref": extract_full_reference_from_text(text),
             }
@@ -1146,6 +1264,7 @@ def handle_customer_message(message):
         else:
             if extract_payment_amount(text):
                 current_pending["claimed_amount"] = extract_payment_amount(text)
+            if extract_full_reference_from_text(text):
                 current_pending["claimed_ref"] = extract_full_reference_from_text(text)
             if extracted_phone:
                 current_pending["phone"] = extracted_phone
@@ -1164,6 +1283,20 @@ def handle_customer_message(message):
                 pending_approvals[customer_key]["package"] = extracted_pkg
                 pending_approvals[customer_key]["package_key"] = extracted_pkg
                 pending_approvals[customer_key]["package_confirmed"] = True
+
+    # 1b. The customer must paste the FULL proof of payment (the whole confirmation message),
+    #     not just some digits of the approval code. If a code arrived without the full proof
+    #     on a not-yet-alerted transaction, ask for the full proof and stop here - no AI call,
+    #     no admin alert. (See proof_is_incomplete for what counts as a full proof.)
+    pend_now = pending_approvals.get(customer_key)
+    if (extracted_ref and pend_now and not pend_now.get("alert_sent")
+            and proof_is_incomplete(pend_now, text)):
+        reply_text = ensure_closing_warning(NEED_FULL_PROOF_MESSAGE)
+        user_memory[customer_key].append({"role": "user", "content": text})
+        user_memory[customer_key].append({"role": "assistant", "content": reply_text})
+        customer_bot.reply_to(message, reply_text)
+        save_state()
+        return
 
     # 2. AUTO-APPROVAL: if the admin pre-registered this exact payment proof (amount +
     #    approval code match) and a matching voucher is in stock, deliver it right now,
@@ -1247,7 +1380,7 @@ def handle_customer_message(message):
         is_likely_ref_attempt = any(kw in text.lower() for kw in ["pp", "code", "ref", "trans", "sent to"]) or len(re.sub(r'[^0-9]', '', text)) >= 4
 
         if short_code_detected and is_likely_ref_attempt:
-            clean_reply = "⚠️ The transaction reference provided is too short. A valid approval code must be at least 7 characters long. Please send the FULL exact transaction reference."
+            clean_reply = "⚠️ That approval code is too short. Please paste the FULL proof of payment - the entire EcoCash confirmation message."
             alerts_to_process = []
         elif short_code_detected and not is_likely_ref_attempt:
             alerts_to_process = []
