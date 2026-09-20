@@ -950,7 +950,8 @@ def register_proofs_from_admin(text):
         if served:
             line += f" A waiting customer ({', '.join(served)}) was auto-approved right away."
         else:
-            line += " Will auto-approve when a customer sends a matching proof."
+            line += (" Will auto-approve when a customer sends a matching proof."
+                     f"\n🗑️ Wrong one? Tap to remove: /delproof_{fp}")
         lines.append(line)
     return "\n".join(lines)
 
@@ -960,10 +961,11 @@ def list_proofs_text():
         items = list(registered_proofs.items())
     if not items:
         return "📭 No registered proofs waiting."
-    lines = [f"- ref ending {fp}: ${p['amount']}" + _party_text(p)
-             for fp, p in items]
-    return "🧾 Registered proofs (auto-approve on match):\n" + "\n".join(lines) + \
-           "\n\nRemove one with /delproof <last 7 chars of the approval code>"
+    # Telegram only makes the command token tappable, and a space ends it - so the ref is
+    # joined with an underscore (/delproof_3877005): one tap sends the whole thing.
+    lines = [f"/delproof_{fp}  —  ${p['amount']}{_party_text(p)}" for fp, p in items]
+    return ("🧾 Registered proofs (auto-approve on match).\n"
+            "Tap a line to DELETE that proof:\n\n" + "\n".join(lines))
 
 
 def handle_proof_admin_message(text):
@@ -971,13 +973,23 @@ def handle_proof_admin_message(text):
     low = text.lower().strip()
     if low in ('/proofs', 'proofs'):
         return list_proofs_text()
-    if low.startswith('/delproof'):
-        fp = proof_fingerprint(text[len('/delproof'):].strip())
+    m = re.match(r'^/delproof(?:[_\s]+(\S+))?\s*$', text.strip(), re.IGNORECASE)
+    if m:
+        arg = m.group(1)
+        if not arg:
+            return list_proofs_text()          # "/delproof" alone -> tappable list
+        fp = proof_fingerprint(arg)
         if not fp:
-            return "Usage: /delproof <last 7 (or all) characters of the approval code>"
+            return ("⚠️ That isn't a valid reference (need at least 7 characters).\n\n"
+                    + list_proofs_text())
         with _proofs_lock:
             removed = registered_proofs.pop(fp, None)
-        return f"🗑️ Removed proof ending {fp}." if removed else f"⚠️ No registered proof ending {fp}."
+        if not removed:
+            return f"⚠️ No registered proof ending {fp} (already used or deleted).\n\n" + list_proofs_text()
+        reply = f"🗑️ Removed proof ending {fp} (${removed.get('amount', '?')}{_party_text(removed)})."
+        with _proofs_lock:
+            remaining = bool(registered_proofs)
+        return reply + ("\n\n" + list_proofs_text() if remaining else "\n\nNo registered proofs left.")
     if PROOF_MARKER_RE.search(text):
         return register_proofs_from_admin(text)
     return None
@@ -1942,7 +1954,7 @@ def sms_webhook():
             admin_bot.send_message(
                 admin_chat_id,
                 f"📲 EcoCash SMS received (sender: {sender or 'unknown'})\n{result}\n\n"
-                "If this wasn't a real payment, remove it with /delproof <last 7 chars>."
+                "If this wasn't a real payment, tap the 🗑️ link above (or send /delproof to see all)."
             )
         except Exception as e:
             print(f"[SMS] Could not notify admin: {e}")
