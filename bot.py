@@ -655,6 +655,63 @@ def parse_bulk_add_entries(text):
         entries.append((code, pkg_key, raw_package))
     return entries
 
+# ==========================================
+# BULK DELETE: delete ALL stocked codes for a whole package in one shot
+# (additive feature - does not touch the existing single-code /deletecode flow)
+# ==========================================
+
+def _package_slug(pkg_key):
+    """Telegram command tokens only allow [a-zA-Z0-9_], so package names like
+    '$1:UNL:24HRS' or '$5 = Unlimited 14d' get squashed into a plain alnum slug,
+    e.g. '1unl24hrs', '5unlimited14d'. Slugs are derived automatically from
+    PACKAGES so this never needs to be kept in sync by hand."""
+    return re.sub(r'[^a-z0-9]', '', pkg_key.lower())
+
+PACKAGE_SLUGS = {_package_slug(pkg): pkg for pkg in PACKAGES}
+
+def delete_all_codes_for_package(pkg_key):
+    with _inventory_lock:
+        removed = list(voucher_inventory.get(pkg_key, []))
+        voucher_inventory[pkg_key] = []
+    return removed
+
+def list_delcodelist_text():
+    lines = []
+    for pkg in PACKAGES:
+        slug = _package_slug(pkg)
+        count = len(voucher_inventory.get(pkg, []))
+        lines.append(f"/delcodelist_{slug}  —  {pkg} ({count} code(s) in stock)")
+    return ("🗑️ Delete ALL codes for a package at once.\n"
+            "Tap a line below to wipe every stocked code for that package:\n\n"
+            + "\n".join(lines))
+
+DELCODELIST_RE = re.compile(r'^/delcodelist(?:[_\s]+(\S+))?\s*$', re.IGNORECASE)
+
+def handle_delcodelist_admin_message(text):
+    """Returns a reply string if this admin message was a bulk-delete-by-package
+    command (/delcodelist or /delcodelist_<slug>), else None so the caller falls
+    through to the rest of the normal admin handling, completely untouched."""
+    m = DELCODELIST_RE.match(text.strip())
+    if not m:
+        return None
+
+    arg = m.group(1)
+    if not arg:
+        return list_delcodelist_text()  # bare "/delcodelist" -> tappable list
+
+    slug = re.sub(r'[^a-z0-9]', '', arg.lower())
+    pkg_key = PACKAGE_SLUGS.get(slug) or normalize_package_compact(arg)
+    if not pkg_key:
+        return (f"⚠️ Unrecognized package '{arg}'.\n\n" + list_delcodelist_text())
+
+    removed = delete_all_codes_for_package(pkg_key)
+    if not removed:
+        return (f"📭 No codes were in stock for {pkg_key} - nothing to delete.\n\n"
+                + list_delcodelist_text())
+
+    return (f"🗑️ Removed {len(removed)} code(s) from {pkg_key}:\n" + ", ".join(removed)
+            + "\n\n" + list_delcodelist_text())
+
 YES_WORDS = {"yes", "y", "approve", "approved", "ok", "okay", "confirm", "confirmed"}
 NO_WORDS = {"no", "n", "reject", "rejected", "cancel", "deny", "denied"}
 
@@ -1168,7 +1225,7 @@ def maybe_bump_admin_for_pending(customer_key, text, label):
     return True
 
 # ==========================================
-# BOT 1: CUSTOMER BOT HANDLER
+# RECONCILE + CUSTOMER BOT HANDLER (see below)
 # ==========================================
 @customer_bot.message_handler(func=lambda message: True)
 def handle_customer_message(message):
@@ -1607,6 +1664,13 @@ def handle_admin_message(message):
     proof_reply = handle_proof_admin_message(text)
     if proof_reply is not None:
         admin_bot.reply_to(message, proof_reply)
+        save_state()
+        return
+
+    # Bulk delete-by-package (additive feature, does not affect /deletecode above).
+    delcodelist_reply = handle_delcodelist_admin_message(text)
+    if delcodelist_reply is not None:
+        admin_bot.reply_to(message, delcodelist_reply)
         save_state()
         return
 
