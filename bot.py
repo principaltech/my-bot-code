@@ -713,6 +713,65 @@ def handle_delcodelist_admin_message(text):
             + "\n\n" + list_delcodelist_text())
 
 YES_WORDS = {"yes", "y", "approve", "approved", "ok", "okay", "confirm", "confirmed"}
+
+# ==========================================
+# FULL MEMORY / DATABASE RESET
+# (additive, destructive admin-only command - guarded behind an explicit confirm step)
+# ==========================================
+
+MEMRESET_RE = re.compile(r'^/memreset(?:[_\s]+(\S+))?\s*$', re.IGNORECASE)
+MEMRESET_CONFIRM_TOKEN = "confirm"
+
+def perform_full_memory_reset():
+    """Wipes every in-memory store and immediately persists the empty state,
+    so the wipe survives a restart instead of being repopulated from the DB
+    on next boot."""
+    user_memory.clear()
+    pending_approvals.clear()
+    user_last_message_id.clear()
+    customer_chat_id.clear()
+    customer_display.clear()
+    customer_last_code.clear()
+    used_payment_refs.clear()
+    intergram_tag_to_key.clear()
+    with _proofs_lock:
+        registered_proofs.clear()
+    with _inventory_lock:
+        for pkg in voucher_inventory:
+            voucher_inventory[pkg] = []
+    with _admin_state_lock:
+        admin_awaiting.clear()
+    save_state()
+
+def handle_memreset_admin_message(text):
+    """Returns a reply string if this admin message was a /memreset command,
+    else None so the caller falls through to the rest of the normal admin
+    handling, completely untouched."""
+    m = MEMRESET_RE.match(text.strip())
+    if not m:
+        return None
+
+    arg = (m.group(1) or "").strip().lower()
+    if arg != MEMRESET_CONFIRM_TOKEN:
+        pending_count = len(pending_approvals)
+        stock_count = sum(len(c) for c in voucher_inventory.values())
+        proof_count = len(registered_proofs)
+        return (
+            "⚠️ This will PERMANENTLY WIPE the ENTIRE database:\n"
+            "- All customer chat histories/memory\n"
+            f"- All pending approvals ({pending_count})\n"
+            "- All customer identity/reconnect mappings (Intergram tags, chat ids)\n"
+            "- Used-payment replay protection (old refs could technically be reused)\n"
+            f"- All registered pre-approved proofs of payment ({proof_count})\n"
+            f"- ALL voucher stock ({stock_count} code(s) across all packages)\n\n"
+            "This CANNOT be undone. Unresolved customer transactions and stocked "
+            "voucher codes will be lost.\n\n"
+            "To proceed anyway, send:\n/memreset_confirm"
+        )
+
+    perform_full_memory_reset()
+    return ("✅ Full reset complete. Chat histories, pending approvals, voucher stock, "
+            "registered proofs, and identity mappings have all been wiped.")
 NO_WORDS = {"no", "n", "reject", "rejected", "cancel", "deny", "denied"}
 
 SERVICE_MESSAGE_PATTERNS = re.compile(
@@ -1672,6 +1731,12 @@ def handle_admin_message(message):
     if delcodelist_reply is not None:
         admin_bot.reply_to(message, delcodelist_reply)
         save_state()
+        return
+
+    # Full database/memory reset (additive, destructive, confirm-guarded).
+    memreset_reply = handle_memreset_admin_message(text)
+    if memreset_reply is not None:
+        admin_bot.reply_to(message, memreset_reply)
         return
 
     awaiting = None
