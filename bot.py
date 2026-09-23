@@ -305,7 +305,7 @@ def build_welcome_message():
         "not just part of the approval code."
     )
 
-PHONE_PATTERN = re.compile(r'\b(07\d{8}|\+?2637\d{8})\b')
+PHONE_PATTERN = re.compile(r'\b(0(?:71|77|78|79)\d{7}|\+?263(?:71|77|78|79)\d{7})\b')
 
 def extract_phone_from_text(text):
     if not text:
@@ -1497,6 +1497,24 @@ def handle_customer_message(message):
 
         alerts_to_process = []
         short_code_detected = False
+
+        # HARD GATE (Python-enforced, not prompt-enforced): an [ADMIN_ALERT] is only ever
+        # honored when this customer has a DETERMINISTICALLY verified transaction to point
+        # to - either a reference our own regex extracted THIS turn, or an already-open
+        # pending_approvals record created from a genuine extraction on an earlier turn.
+        # If neither exists, the alert (and any code/phone/package inside it) is pure model
+        # output with zero Python-side evidence behind it, so it's discarded outright rather
+        # than parsed. This closes the gap where a bare, unlabeled string with no "approval
+        # code"/"transaction id" label (e.g. a customer pasting only "3928906") could
+        # otherwise let a hallucinated ADMIN_ALERT reach the admin or get compared against
+        # registered_proofs, without ever passing through extract_code_ending_from_text.
+        has_genuine_basis = bool(extracted_ref) or bool(pending_approvals.get(customer_key))
+
+        if alerts and not has_genuine_basis:
+            print(f"[GUARD] Discarded {len(alerts)} AI-generated [ADMIN_ALERT] block(s) for "
+                  f"{customer_key}: no genuine extracted reference or open pending transaction "
+                  "this turn - refusing to trust model-only code/phone/package.")
+            alerts = []
 
         if alerts:
             for alert_text in alerts:
