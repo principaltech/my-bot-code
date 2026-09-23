@@ -922,6 +922,33 @@ def parse_proof_blocks(text):
     return proofs
 
 
+def find_probable_match(code_ending):
+    """Given a customer's code ending, look up a registered proof with the same
+    fingerprint. This is advisory ONLY - it is never used to auto-approve or
+    auto-send a voucher. It exists purely to save the admin a lookup when
+    deciding whether to reply YES to a pending request."""
+    fp = proof_fingerprint(code_ending)
+    if not fp:
+        return None, None
+    with _proofs_lock:
+        return fp, registered_proofs.get(fp)
+
+
+def probable_match_note(code_ending):
+    """One-line note to append to an admin alert/reminder if a registered proof
+    shares this code ending's fingerprint. Returns '' if there's no candidate."""
+    fp, proof = find_probable_match(code_ending)
+    if not proof:
+        return ""
+    return (
+        f"\n\n💡 Possible match on file: ${proof['amount']}{_party_text(proof)}, "
+        f"ref ending {fp} (registered {int(time.time() - proof['registered_at'])}s ago). "
+        "This did NOT auto-approve (full code or amount didn't line up) - please compare "
+        "against what the customer sent before replying YES.\n"
+        f"🗑️ Not a match? Tap to remove it: /matchreject_{fp}"
+    )
+
+
 def try_auto_approve(customer_key):
     """Returns True only if a voucher was delivered. Returns False (touching nothing)
     whenever anything doesn't line up, so the normal manual flow takes over."""
@@ -1091,11 +1118,16 @@ def handle_proof_admin_message(text):
     low = text.lower().strip()
     if low in ('/proofs', 'proofs'):
         return list_proofs_text()
-    m = re.match(r'^/delproof(?:[_\s]+(\S+))?\s*$', text.strip(), re.IGNORECASE)
+
+    # /delproof_<fp> and /matchreject_<fp> are aliases - both delete a registered
+    # proof by its fingerprint. matchreject exists so the tappable link in a
+    # "possible match" suggestion note reads honestly (rejecting a suggested
+    # match, not browsing/deleting from the full /proofs list).
+    m = re.match(r'^/(?:delproof|matchreject)(?:[_\s]+(\S+))?\s*$', text.strip(), re.IGNORECASE)
     if m:
         arg = m.group(1)
         if not arg:
-            return list_proofs_text()          # "/delproof" alone -> tappable list
+            return list_proofs_text()          # bare "/delproof" -> tappable list
         fp = proof_fingerprint(arg)
         if not fp:
             return ("⚠️ That isn't a valid reference (need at least 7 characters).\n\n"
@@ -1108,6 +1140,7 @@ def handle_proof_admin_message(text):
         with _proofs_lock:
             remaining = bool(registered_proofs)
         return reply + ("\n\n" + list_proofs_text() if remaining else "\n\nNo registered proofs left.")
+
     if PROOF_MARKER_RE.search(text):
         return register_proofs_from_admin(text)
     return None
@@ -1264,6 +1297,8 @@ def maybe_bump_admin_for_pending(customer_key, text, label):
     if now - last < REBUMP_COOLDOWN_SECONDS:
         return False  # already nudged recently, don't spam
 
+    note = probable_match_note(info.get("code_ending"))
+
     if admin_chat_id:
         if info.get("proposed_code"):
             admin_bot.send_message(
@@ -1272,6 +1307,7 @@ def maybe_bump_admin_for_pending(customer_key, text, label):
                 f"(code ending {info.get('code_ending')}, {info.get('package')}, "
                 f"phone {info.get('phone')}). A stored code is already reserved for them "
                 f"('{info['proposed_code']}') — reply YES to send it, or NO to hold it."
+                + note
             )
         else:
             admin_bot.send_message(
@@ -1280,6 +1316,7 @@ def maybe_bump_admin_for_pending(customer_key, text, label):
                 f"(code ending {info.get('code_ending')}, {info.get('package')}, "
                 f"phone {info.get('phone')}). No stock code is reserved yet — reply with a "
                 f"voucher code to approve, or 'no' to reject."
+                + note
             )
     info["last_alert_time"] = now
     save_state()
@@ -1609,6 +1646,7 @@ def handle_customer_message(message):
                                 f"Package: {parsed['package']}\n\n"
                                 f"Stored voucher found: {reserved_code}\n"
                                 f"Reply YES to send it to the customer, or NO to hold it and provide a different code."
+                                + probable_match_note(parsed['code_ending'])
                             )
                         else:
                             admin_msg = (
@@ -1619,17 +1657,20 @@ def handle_customer_message(message):
                                 f"Phone: {parsed['phone']}\n"
                                 f"Package: {parsed['package']}\n\n"
                                 f"No stored code for this package. Reply with a new voucher code to approve, or 'no' to reject."
+                                + probable_match_note(parsed['code_ending'])
                             )
                     else:
                         if customer_key in pending_approvals and pending_approvals[customer_key].get("alert_sent"):
                             continue
+                        fallback_ending = extract_code_ending_from_text(text) or ""
                         pending_approvals[customer_key] = {
-                            "code_ending": extract_code_ending_from_text(text) or "",
+                            "code_ending": fallback_ending,
                             "price": "", "phone": "", "package": "",
                             "package_key": None, "proposed_code": None, "alert_sent": True,
                             "last_alert_time": time.time(),
                         }
-                        admin_msg = f"🔔 ADMIN ALERT (Customer: {label}):\n{alert_text}"
+                        admin_msg = (f"🔔 ADMIN ALERT (Customer: {label}):\n{alert_text}"
+                                      + probable_match_note(fallback_ending))
                     admin_bot.send_message(admin_chat_id, admin_msg)
             else:
                 clean_reply += "\n\n⚠️ SYSTEM NOTIFICATION: The Admin Bot is currently unlinked. (Admin: Please send /start to the Admin bot to reconnect routing)."
@@ -1889,7 +1930,7 @@ def handle_admin_message(message):
             message,
             "⚠️ Unknown command. Available:\n"
             "/stock, /stockfull, /stockdetail, /listcodes, /codes, /addcode, /deletecode, "
-            "/proofs, /delproof"
+            "/proofs, /delproof, /matchreject"
         )
         return
 
@@ -2127,7 +2168,7 @@ def run_admin_bot():
 
 if __name__ == "__main__":
     import sys
-    print("[VERSION] splash_bot.py — lenient package matching + open-pending guard fix + Intergram reconnect + pre-registered proof auto-approval", flush=True)
+    print("[VERSION] splash_bot.py — lenient package matching + open-pending guard fix + Intergram reconnect + pre-registered proof auto-approval + admin match-suggestion", flush=True)
     load_state()
     print(f"[Groq] Loaded {len(groq_clients)} API key(s) for rotation/fallback.", flush=True)
     print(f"[AUTO] Auto-approval {'ENABLED' if AUTO_APPROVE_ENABLED else 'DISABLED'} "
