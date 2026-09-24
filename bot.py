@@ -84,17 +84,17 @@ def create_completion(messages, **kwargs):
 # STORAGE
 # ==========================================
 user_memory = {}
-user_last_message_id = {}   
-customer_chat_id = {}       
-customer_display = {}       
-customer_last_code = {}     
+user_last_message_id = {}
+customer_chat_id = {}
+customer_display = {}
+customer_last_code = {}
 customer_last_phone = {}    # customer_key -> last Python-VERIFIED phone number (persists across
                              # turns even before a payment reference exists, so a legitimately
                              # provided phone isn't forgotten by the time proof of payment arrives)
 admin_chat_id = None
 
 # ==========================================
-# PERSISTENCE 
+# PERSISTENCE
 # ==========================================
 DATABASE_URL = os.environ.get("DATABASE_URL")
 _db_lock = Lock()
@@ -249,7 +249,7 @@ You are an automated customer care AI assistant for Splash Internet. You MUST fo
    - $10 = Unlimited 30d = USD $10.00 = UNLIMITED
 3. PAYMENTS & PROOF OF PAYMENT:
    - EcoCash number is 0776248396.
-   - You need three things: (a) the customer's phone number, (b) the package, and (c) proof of payment.
+   - You only need proof of payment. The backend detects the package from the amount and does NOT need a phone number unless the payment takes long.
    - PHONE NUMBER FORMAT: A valid Zimbabwean mobile number is exactly 10 digits starting with 071, 077, 078, or 079 (e.g. 0771234567), or the same number in +263 format (e.g. +263771234567). This is a SEPARATE rule from the transaction reference length below - do not confuse the two. If the customer's phone number is missing digits, has the wrong prefix, or is otherwise not in this format, ask them to resend it correctly. NEVER treat a 7-digit string as a valid phone number.
    - DISTINGUISH REPLIES: If the user is just answering a question about which package they want (e.g. saying "7d", "7 days", "lite"), DO NOT treat it as a payment reference. Only evaluate transaction references when a full payment confirmation block is provided.
    - A VALID TRANSACTION REFERENCE MUST BE AT LEAST 7 CHARACTERS LONG. If a user provides a reference that is less than 7 characters as a payment code, reject it.
@@ -258,7 +258,7 @@ You are an automated customer care AI assistant for Splash Internet. You MUST fo
    - Tell the user to wait 30 seconds while the payment is validated. That is ALL you say about the outcome.
    - CRITICAL: Do NOT attempt to repeat, quote, or summarize the customer's transaction reference back to them in your conversational reply. The reference must ONLY be output inside the [ADMIN_ALERT] tag.
 5. ADMIN PAYMENT APPROVAL (CRITICAL INSTRUCTION):
-   - When a user has provided their phone number, package, AND a valid payment reference (minimum 7 chars), generate the exact tag [ADMIN_ALERT] followed immediately by a structured line:
+   - When a user has provided a valid payment reference (minimum 7 chars), generate the exact tag [ADMIN_ALERT] followed immediately by a structured line:
      [ADMIN_ALERT] CODE_ENDING: <exact last 7 characters> | PRICE: $<amount> | PHONE: <customer phone number> | PACKAGE: <package name> - Admin, please provide a voucher code.
    - NEVER generate this alert if the code is under 7 characters.
 6. ADMIN REPLIES:
@@ -273,18 +273,16 @@ You are an automated customer care AI assistant for Splash Internet. You MUST fo
    - If you see a SYSTEM NOTE telling you a new payment reference was submitted, treat it as a completely separate, brand-new transaction. Do NOT reuse a phone number or package mentioned earlier in this chat for that new reference. Ask the customer to (re)confirm both before producing any [ADMIN_ALERT].
 11. NEVER FABRICATE A "PAYMENT RECEIVED" REPLY:
    - Only tell the customer their payment was received / to wait 30 seconds if THIS message actually contains a new, valid transaction reference. If the customer's latest message is something else (a package choice, "resend", a greeting, etc.) with no reference in it, do NOT repeat or imply an earlier payment confirmation from chat history - ask them for the actual proof of payment instead.
-12. ONE-MESSAGE FORMAT (ALWAYS RECOMMEND THIS):
-   - Whenever the customer wants to buy, asks how to pay, or has not yet given all three details, recommend that they send EVERYTHING in ONE message, using exactly this format:
-     Phone number:
-     Package:
+12. PROOF OF PAYMENT FORMAT (ALWAYS RECOMMEND THIS):
+   - Whenever the customer wants to buy, asks how to pay, or has not yet sent proof, tell them to pay via EcoCash and then paste the FULL proof of payment in ONE message, using exactly this format:
      Paste Full Proof of payment:
-   - Tell them to paste the ENTIRE EcoCash confirmation message (the whole "Transfer Confirmation: ... Approval Code: ... New balance: ..." text), NOT just the last digits of the approval code. The backend reads the full approval code and the amount from it and compares them with our records.
+   - Tell them to paste the ENTIRE EcoCash confirmation message (the whole "Transfer Confirmation: ... Approval Code: ... New balance: ..." text), NOT just the last digits of the approval code. The backend reads the full approval code and the amount from it, detects the package from the amount, and compares it with our records.
    - If the customer sends only part of the code, politely ask them to paste the FULL proof of payment.
-   - If some details are still missing, ask only for the missing ones and show the same format.
+   - Do NOT ask for a phone number or package up front.
 """
 
 WAIT_MESSAGE = "Thank you, we have received your payment proof. Please wait about 30 seconds while we validate the payment."
-ONE_MESSAGE_FORMAT = "Phone number:\nPackage:\nPaste Full Proof of payment:"
+ONE_MESSAGE_FORMAT = "Paste Full Proof of payment:"
 NEED_PROOF_MESSAGE = (
     "Please send everything in ONE message, using this format:\n\n"
     + ONE_MESSAGE_FORMAT +
@@ -305,10 +303,9 @@ def build_welcome_message():
     return (
         "👋 Welcome to Splash Internet!\n\n"
         "Packages:\n" + "\n".join(lines) + "\n\n"
-        "Pay via EcoCash to 0776248396, then send EVERYTHING in ONE message, using this format:\n\n"
-        + ONE_MESSAGE_FORMAT +
-        "\n\nPaste the ENTIRE EcoCash confirmation message (from \"Transfer Confirmation\" to the end), "
-        "not just part of the approval code."
+        "Pay via EcoCash to 0776248396, then just paste the ENTIRE EcoCash confirmation message "
+        "(from \"Transfer Confirmation\" to the end) here. Your package is detected automatically "
+        "from the amount you paid."
     )
 
 PHONE_PATTERN = re.compile(r'\b(0(?:71|77|78|79)\d{7}|\+?263(?:71|77|78|79)\d{7})\b')
@@ -485,10 +482,10 @@ def parse_admin_alert(alert_text, user_text="", authoritative_code=None):
     m = pattern.search(alert_text)
     if not m:
         return None
-        
+
     code_ending = m.group("code").strip(" -\u2014:")
     code_alphanum = re.sub(r'[^A-Za-z0-9]', '', code_ending)
-    
+
     real_ending = extract_code_ending_from_text(user_text)
 
     # Preference order for the code ending:
@@ -1412,6 +1409,49 @@ def reconcile_returning_customer(message, chat_customer_key, raw_text):
     return old_key, cleaned_text
 
 
+# ------------------------------------------
+# STOCK RESERVATION FOR WAITING REQUESTS
+# ------------------------------------------
+def _pending_package_key(info):
+    pk = info.get("package_key")
+    if pk in PACKAGES:
+        return pk
+    return normalize_package_compact(info.get("package")) if info.get("package") else None
+
+def reserve_stock_for_waiting(only_package=None, notify=True):
+    """Give every already-alerted request that has NO reserved code a code from stock, if
+    any is available now. Call after stock is added, and before reminders/decisions.
+    Returns the number of requests that got a code."""
+    assigned = 0
+    for ckey, info in list(pending_approvals.items()):
+        if not info.get("alert_sent") or info.get("proposed_code"):
+            continue
+        pk = _pending_package_key(info)
+        if not pk or (only_package and pk != only_package):
+            continue
+        code = reserve_voucher(pk)
+        if not code:
+            continue
+        info["proposed_code"] = code
+        info["package_key"] = pk
+        assigned += 1
+        if notify and admin_chat_id:
+            try:
+                admin_bot.send_message(
+                    admin_chat_id,
+                    f"📦 Stock is now available for {customer_display.get(ckey, ckey)} "
+                    f"(code ending {info.get('code_ending')}, {pk}).\n"
+                    f"Stored voucher reserved: {code}\n"
+                    "Reply YES to send it to the customer, or NO to hold it and provide a different code."
+                    + probable_match_note(info.get("code_ending"))
+                )
+            except Exception as e:
+                print(f"[STOCK] Could not notify admin: {e}")
+    if assigned:
+        save_state()
+    return assigned
+
+
 def maybe_bump_admin_for_pending(customer_key, text, label):
     """
     Call this for any message that reconciled to an existing, already-alerted,
@@ -1432,6 +1472,11 @@ def maybe_bump_admin_for_pending(customer_key, text, label):
     last = info.get("last_alert_time", 0)
     if now - last < REBUMP_COOLDOWN_SECONDS:
         return False  # already nudged recently, don't spam
+
+    # Stock may have been added since the original alert - reserve it first.
+    if not info.get("proposed_code") and reserve_stock_for_waiting(_pending_package_key(info)):
+        info["last_alert_time"] = now
+        return True   # the helper already sent the "stock is now available" message
 
     note = probable_match_note(info.get("code_ending"))
 
@@ -1458,8 +1503,251 @@ def maybe_bump_admin_for_pending(customer_key, text, label):
     save_state()
     return True
 
+
+# ==========================================================================
+# SMART PAYMENT FAST-PATH (no phone/package interrogation)
+# ==========================================================================
+PHONE_ASK_AFTER_SECONDS = int(os.environ.get("PHONE_ASK_AFTER_SECONDS", "180"))  # 0 = never ask proactively
+
+FRUSTRATION_RE = re.compile(
+    r"(where.?s?\s+my|still\s+waiting|how\s+long|taking\s+(so\s+|too\s+)?long|too\s+long|"
+    r"waiting\s+(for\s+)?(so\s+|too\s+)?long|hurry|urgent|any\s+update|not\s+yet|"
+    r"\?{2,}|!{2,}|scam|fake|cheat|refund|useless|wasting)",
+    re.IGNORECASE
+)
+
+_REF_TOKEN_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9.\-]{6,}')
+
+def extract_registered_bare_ref(text):
+    """Customer pasted just the last digits / bare code (no label). Only trusted when its
+    last 7 characters match a proof the admin (or SMS webhook) already registered."""
+    if not text:
+        return None
+    for tok in _REF_TOKEN_RE.findall(text):
+        if PHONE_PATTERN.fullmatch(tok):
+            continue  # a phone number, not a reference
+        if sum(ch.isdigit() for ch in normalize_ref(tok)) < 4:
+            continue
+        fp = proof_fingerprint(tok)
+        if fp:
+            with _proofs_lock:
+                if fp in registered_proofs:
+                    return fp
+    return None
+
+def choose_package(amount, explicit_pkg):
+    """Package from the amount paid. Ambiguous amounts use the customer's own choice if it is
+    one of the candidates, otherwise None (=> ask)."""
+    candidates = PRICE_TO_PACKAGES.get(amount or "", [])
+    if len(candidates) == 1:
+        return candidates[0], candidates
+    if len(candidates) > 1:
+        return (explicit_pkg if explicit_pkg in candidates else None), candidates
+    return (explicit_pkg if explicit_pkg in PACKAGES else None), list(PACKAGES)
+
+def package_question(amount, candidates):
+    opts = "\n".join(f"- {p} ({PACKAGES[p]['data']})" for p in candidates)
+    if amount and len(candidates) < len(PACKAGES):
+        head = f"Your payment of ${amount} matches more than one package:"
+    else:
+        head = "Which package would you like?"
+    return f"{head}\n{opts}\n\nPlease reply with just the package name."
+
+def _send_reply(message, customer_key, out_text, user_text=None):
+    out_text = ensure_closing_warning(out_text)
+    hist = user_memory.setdefault(customer_key, [{"role": "system", "content": system_rules}])
+    if user_text is not None:
+        hist.append({"role": "user", "content": user_text})
+    hist.append({"role": "assistant", "content": out_text})
+    if len(hist) > 15:
+        user_memory[customer_key] = [hist[0]] + hist[-14:]
+    customer_bot.reply_to(message, out_text)
+    save_state()
+
+def needs_phone(info, text):
+    if info.get("phone"):
+        return False
+    t0 = info.get("alert_time") or info.get("last_alert_time") or time.time()
+    waited_long = PHONE_ASK_AFTER_SECONDS > 0 and (time.time() - t0) >= PHONE_ASK_AFTER_SECONDS
+    return waited_long or bool(FRUSTRATION_RE.search(text or ""))
+
+def reply_pending_status(message, customer_key, text):
+    """Customer is following up on an already-alerted transaction. No LLM involved."""
+    info = pending_approvals.get(customer_key)
+    if not info or not info.get("alert_sent"):
+        return False
+    if try_auto_approve(customer_key):   # proof may have been registered since
+        return True
+    label = customer_display.get(customer_key, customer_key)
+
+    phone = extract_phone_from_message(text)
+    if phone:
+        info["phone"] = phone
+        info["phone_confirmed"] = True
+        customer_last_phone[customer_key] = phone
+        if admin_chat_id:
+            try:
+                admin_bot.send_message(
+                    admin_chat_id,
+                    f"📞 {label} provided their phone number: {phone}\n"
+                    f"(code ending {info.get('code_ending')}, {info.get('package')})"
+                )
+            except Exception as e:
+                print(f"[PHONE] Could not notify admin: {e}")
+        _send_reply(message, customer_key,
+                    "Thank you - we've passed your phone number to our team. "
+                    "You'll get your voucher as soon as the payment is approved.", text)
+        return True
+
+    maybe_bump_admin_for_pending(customer_key, text, label)
+    reply = ("Your payment is still with our team for verification — we haven't forgotten you. "
+             "You'll get your voucher code the moment it's approved.")
+    if needs_phone(info, text):
+        info["phone_asked"] = time.time()
+        reply += ("\n\nTo help us speed this up, please also send your phone number "
+                  "(e.g. 0771234567).")
+    _send_reply(message, customer_key, reply, text)
+    return True
+
+def alert_admin_for_pending(message, customer_key, pkg, amount, proof, partial, text):
+    info = pending_approvals[customer_key]
+    if not admin_chat_id:
+        _send_reply(message, customer_key,
+                    "⚠️ SYSTEM NOTIFICATION: The Admin Bot is currently unlinked. "
+                    "(Admin: Please send /start to the Admin bot to reconnect routing).", text)
+        return True
+
+    label = customer_display.get(customer_key, str(customer_key))
+    if info.get("proposed_code"):
+        return_voucher(info.get("package_key"), info["proposed_code"])
+    reserved = reserve_voucher(pkg)
+    now = time.time()
+    info.update({
+        "package": pkg, "package_key": pkg,
+        "price": f"${amount}" if amount else PACKAGES[pkg]["price"],
+        "proposed_code": reserved, "alert_sent": True,
+        "package_confirmed": True, "alert_time": now, "last_alert_time": now,
+    })
+
+    ending = info["code_ending"]
+    fp = proof_fingerprint(ending)
+    if proof and partial:
+        basis = (f"✅ Matches registered proof: ${proof['amount']}{_party_text(proof)}, ref ending {fp}.\n"
+                 "Customer sent ONLY the last digits (not the full proof).\n")
+        note = f"\n🗑️ Not a match? /matchreject_{fp}"
+    elif proof:
+        basis, note = "", probable_match_note(ending)
+    else:
+        basis, note = "⚠️ No registered proof on file for this reference - verify manually.\n", ""
+
+    if reserved:
+        head = "🔔 PAYMENT APPROVAL — STOCK CODE AVAILABLE"
+        tail = (f"Stored voucher found: {reserved}\n"
+                "Reply YES to send it to the customer, or NO to hold it and provide a different code.")
+    else:
+        head = "🔔 NEW PAYMENT APPROVAL REQUEST — OUT OF STOCK"
+        tail = "No stored code for this package. Reply with a new voucher code to approve, or 'no' to reject."
+
+    phone_line = info.get("phone") or ("requested from customer" if not proof else "not provided")
+    admin_msg = (f"{head}\nCustomer: {label}\n{basis}Code ending: {ending}\n"
+                 f"Price: {info['price']}\nPhone: {phone_line}\n"
+                 f"Package: {pkg}\n\n{tail}{note}")
+    try:
+        admin_bot.send_message(admin_chat_id, admin_msg)
+    except Exception as e:
+        print(f"[ALERT] Could not notify admin: {e}")
+
+    reply = WAIT_MESSAGE
+    # No saved proof to verify against -> ask for the phone number right away
+    # (unless they already included a valid one in their message).
+    if not proof and not info.get("phone"):
+        info["phone_asked"] = time.time()   # stops the watchdog from asking a second time
+        reply += ("\n\nSince we're verifying this payment manually, please also send your "
+                  "phone number (e.g. 0771234567).")
+    _send_reply(message, customer_key, reply, text)
+    return True
+
+def advance_pending(message, customer_key, text):
+    """Deterministic payment handling. Returns True if a reply was sent."""
+    info = pending_approvals.get(customer_key)
+    if not info:
+        return False
+    if info.get("alert_sent"):
+        return reply_pending_status(message, customer_key, text)
+
+    fp = proof_fingerprint(info.get("code_ending"))
+    if not fp:
+        return False
+
+    if fp in used_payment_refs:
+        pending_approvals.pop(customer_key, None)
+        if admin_chat_id:
+            try:
+                admin_bot.send_message(
+                    admin_chat_id,
+                    f"⚠️ DUPLICATE payment proof from {customer_display.get(customer_key, customer_key)} "
+                    f"(ref ending {fp}). A voucher was already issued for it.")
+            except Exception:
+                pass
+        _send_reply(message, customer_key, DUPLICATE_MESSAGE, text)
+        return True
+
+    if try_auto_approve(customer_key):      # full proof + matching saved proof -> done
+        return True
+
+    with _proofs_lock:
+        proof = registered_proofs.get(fp)
+    partial = proof_is_incomplete(info, text)
+
+    if partial and not proof:
+        _send_reply(message, customer_key, NEED_FULL_PROOF_MESSAGE, text)
+        return True
+
+    amount = proof["amount"] if proof else info.get("claimed_amount")
+    pkg, candidates = choose_package(amount, info.get("package_key"))
+    if not pkg:
+        info["package"] = None
+        info["package_key"] = None
+        _send_reply(message, customer_key, package_question(amount, candidates), text)
+        return True
+
+    return alert_admin_for_pending(message, customer_key, pkg, amount, proof, partial, text)
+
+def run_phone_watchdog():
+    """If approval drags on, ask for the phone number once, without waiting for the customer."""
+    while True:
+        time.sleep(20)
+        try:
+            if PHONE_ASK_AFTER_SECONDS <= 0:
+                continue
+            now = time.time()
+            changed = False
+            for key, info in list(pending_approvals.items()):
+                if not info.get("alert_sent") or info.get("phone") or info.get("phone_asked"):
+                    continue
+                t0 = info.get("alert_time") or info.get("last_alert_time")
+                chat_id = customer_chat_id.get(key)
+                if not t0 or now - t0 < PHONE_ASK_AFTER_SECONDS or chat_id is None:
+                    continue
+                info["phone_asked"] = now
+                changed = True
+                msg = ensure_closing_warning(
+                    "Sorry for the wait - your payment is still being verified. To help us speed "
+                    "things up, please send your phone number (e.g. 0771234567).")
+                try:
+                    customer_bot.send_message(chat_id, msg)
+                    user_memory.setdefault(key, [{"role": "system", "content": system_rules}]) \
+                               .append({"role": "assistant", "content": msg})
+                except Exception as e:
+                    print(f"[WATCHDOG] Could not message {key}: {e}")
+            if changed:
+                save_state()
+        except Exception as e:
+            print(f"[WATCHDOG] Error: {e}")
+
+
 # ==========================================
-# RECONCILE + CUSTOMER BOT HANDLER (see below)
+# CUSTOMER BOT HANDLER
 # ==========================================
 @customer_bot.message_handler(func=lambda message: True)
 def handle_customer_message(message):
@@ -1484,6 +1772,8 @@ def handle_customer_message(message):
 
     # 1. Deterministic Python Pre-Extraction & Slot Management
     extracted_ref = extract_code_ending_from_text(text)
+    if not extracted_ref:
+        extracted_ref = extract_registered_bare_ref(text)   # last 7 digits matching a saved proof
     extracted_phone = extract_phone_from_message(text)
     extracted_pkg = extract_package_from_message(text)
 
@@ -1510,29 +1800,10 @@ def handle_customer_message(message):
 
     # If this is just a status follow-up on an already-open, already-alerted
     # transaction (no fresh reference this turn), answer from real state and
-    # skip the LLM entirely - guarantees no fabricated status, and only bumps
-    # the admin at most once per cooldown window instead of on every message.
+    # skip the LLM entirely - guarantees no fabricated status, bumps the admin at
+    # most once per cooldown window, and asks for a phone number if the wait drags on.
     if not extracted_ref:
-        label = customer_display.get(customer_key, customer_key)
-        pending_info = pending_approvals.get(customer_key)
-        # Covers BOTH sub-states of an open, already-alerted transaction:
-        #   - a stock code is reserved and we're waiting on admin's YES/NO, or
-        #   - nothing is in stock and we're waiting on admin to supply a code.
-        # Either way: no LLM call (so nothing can be improvised), and the admin
-        # gets bumped (subject to cooldown) instead of silently hearing nothing.
-        if pending_info and pending_info.get("alert_sent"):
-            # If the admin has registered this payment's proof since the customer
-            # first sent it, a simple follow-up ("resend", "hi") can now complete it.
-            if try_auto_approve(customer_key):
-                return
-            maybe_bump_admin_for_pending(customer_key, text, label)
-            reply_text = ensure_closing_warning(
-                "Your payment is still with our team for verification — we haven't forgotten you. "
-                "You'll get your voucher code the moment it's approved."
-            )
-            user_memory[customer_key].append({"role": "assistant", "content": reply_text})
-            customer_bot.reply_to(message, reply_text)
-            save_state()
+        if reply_pending_status(message, customer_key, text):
             return
 
     # Deterministic welcome: always shows the one-message format (no AI involved).
@@ -1548,6 +1819,8 @@ def handle_customer_message(message):
         current_pending = pending_approvals.get(customer_key)
         # If approval code changed or is new, force reset phone/package slots
         if not current_pending or current_pending.get("code_ending") != extracted_ref:
+            if current_pending and current_pending.get("proposed_code"):
+                return_voucher(current_pending.get("package_key"), current_pending["proposed_code"])
             is_repeat_customer = current_pending is not None
             pending_approvals[customer_key] = {
                 "code_ending": extracted_ref,
@@ -1604,24 +1877,11 @@ def handle_customer_message(message):
                 pending_approvals[customer_key]["package_key"] = extracted_pkg
                 pending_approvals[customer_key]["package_confirmed"] = True
 
-    # 1b. The customer must paste the FULL proof of payment (the whole confirmation message),
-    #     not just some digits of the approval code. If a code arrived without the full proof
-    #     on a not-yet-alerted transaction, ask for the full proof and stop here - no AI call,
-    #     no admin alert. (See proof_is_incomplete for what counts as a full proof.)
-    pend_now = pending_approvals.get(customer_key)
-    if (extracted_ref and pend_now and not pend_now.get("alert_sent")
-            and proof_is_incomplete(pend_now, text)):
-        reply_text = ensure_closing_warning(NEED_FULL_PROOF_MESSAGE)
-        user_memory[customer_key].append({"role": "user", "content": text})
-        user_memory[customer_key].append({"role": "assistant", "content": reply_text})
-        customer_bot.reply_to(message, reply_text)
-        save_state()
-        return
+    # Payment fast-path: auto-approve on full proof, or alert admin (package chosen by price).
+    if extracted_ref or extracted_pkg or extracted_phone:
+        if advance_pending(message, customer_key, text):
+            return
 
-    # 2. AUTO-APPROVAL: if the admin pre-registered this exact payment proof (amount +
-    #    approval code match) and a matching voucher is in stock, deliver it right now,
-    #    skip the AI entirely, and delete the registered proof. Anything that doesn't
-    #    line up returns False and the normal AI + admin approval flow continues below.
     if try_auto_approve(customer_key):
         return
 
@@ -1632,7 +1892,7 @@ def handle_customer_message(message):
         completion = create_completion(
             user_memory[customer_key],
             model="openai/gpt-oss-120b",
-            temperature=0.3,   
+            temperature=0.3,
             max_completion_tokens=2048,
             top_p=1
         )
@@ -1711,8 +1971,8 @@ def handle_customer_message(message):
                         raw_c = re.sub(r'[^A-Za-z0-9]', '', m.group(1))
                         if raw_c and len(raw_c) < 7:
                             short_code_detected = True
-                            continue 
-                    
+                            continue
+
                     alerts_to_process.append((alert_text, None))
 
         is_likely_ref_attempt = any(kw in text.lower() for kw in ["pp", "code", "ref", "trans", "sent to"]) or len(re.sub(r'[^0-9]', '', text)) >= 4
@@ -1874,7 +2134,7 @@ def handle_customer_message(message):
         if clean_reply:
             clean_reply = ensure_closing_warning(clean_reply)
             history_entry = clean_reply
-            
+
             if alerts_to_process and not duplicate_notice:
                 history_entry += "".join(f"\n[ADMIN_ALERT]{a[0]}" for a in alerts_to_process)
             user_memory[customer_key].append({"role": "assistant", "content": history_entry})
@@ -2001,6 +2261,7 @@ def handle_admin_message(message):
                 f"✅ Added to stock:\n{code} → {pkg_key} ({PACKAGES[pkg_key]['price']}, {PACKAGES[pkg_key]['data']})"
             )
             save_state()
+            reserve_stock_for_waiting(pkg_key)
         else:
             admin_bot.reply_to(
                 message,
@@ -2066,6 +2327,7 @@ def handle_admin_message(message):
             )
         admin_bot.reply_to(message, "\n\n".join(reply_parts))
         save_state()
+        reserve_stock_for_waiting()
         return
 
     delete_matches = [m for m in (DELETE_CODE_PATTERN.match(line) for line in text.splitlines()) if m]
@@ -2116,6 +2378,7 @@ def handle_admin_message(message):
             )
         admin_bot.reply_to(message, "\n\n".join(reply_parts))
         save_state()
+        reserve_stock_for_waiting()
         return
 
     if text.startswith('/'):
@@ -2163,6 +2426,21 @@ def handle_admin_message(message):
             customer_bot.send_message(target_chat_id, msg_text, reply_to_message_id=reply_id)
         else:
             customer_bot.send_message(target_chat_id, msg_text)
+
+    # Admin says YES but nothing was reserved (request was raised while out of stock):
+    # take a code from stock now instead of sending the word "yes" as a voucher.
+    if not info.get("proposed_code") and text.strip().lower() in YES_WORDS:
+        pk = _pending_package_key(info)
+        code_now = reserve_voucher(pk) if pk else None
+        if not code_now:
+            admin_bot.reply_to(
+                message,
+                f"⚠️ Still no stock for {pk or 'that package'}. Send a voucher code to approve "
+                "this customer, or 'no' to reject."
+            )
+            return
+        info["proposed_code"] = code_now
+        info["package_key"] = pk
 
     if info.get("proposed_code"):
         decision = text.strip().lower()
@@ -2361,7 +2639,7 @@ def run_admin_bot():
 
 if __name__ == "__main__":
     import sys
-    print("[VERSION] splash_bot.py — lenient package matching + open-pending guard fix + Intergram reconnect + pre-registered proof auto-approval + admin match-suggestion", flush=True)
+    print("[VERSION] splash_bot.py — smart payment fast-path (price-based package, no up-front phone) + auto stock reservation + YES-on-unreserved fix + Intergram reconnect + pre-registered proof auto-approval", flush=True)
     load_state()
     print(f"[Groq] Loaded {len(groq_clients)} API key(s) for rotation/fallback.", flush=True)
     print(f"[AUTO] Auto-approval {'ENABLED' if AUTO_APPROVE_ENABLED else 'DISABLED'} "
@@ -2369,5 +2647,6 @@ if __name__ == "__main__":
     print(f"[SMS] Webhook /sms {'ENABLED' if SMS_WEBHOOK_SECRET else 'DISABLED (set SMS_WEBHOOK_SECRET to enable)'}.", flush=True)
     Thread(target=run_customer_bot).start()
     Thread(target=run_admin_bot).start()
+    Thread(target=run_phone_watchdog, daemon=True).start()
     port = int(os.environ.get('PORT', 5000))
     app.run(host='0.0.0.0', port=port)
