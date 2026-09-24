@@ -245,6 +245,7 @@ You are an automated customer care AI assistant for Splash Internet. You MUST fo
 3. PAYMENTS & PROOF OF PAYMENT:
    - EcoCash number is 0776248396.
    - You need three things: (a) the customer's phone number, (b) the package, and (c) proof of payment.
+   - PHONE NUMBER FORMAT: A valid Zimbabwean mobile number is exactly 10 digits starting with 071, 077, 078, or 079 (e.g. 0771234567), or the same number in +263 format (e.g. +263771234567). This is a SEPARATE rule from the transaction reference length below - do not confuse the two. If the customer's phone number is missing digits, has the wrong prefix, or is otherwise not in this format, ask them to resend it correctly. NEVER treat a 7-digit string as a valid phone number.
    - DISTINGUISH REPLIES: If the user is just answering a question about which package they want (e.g. saying "7d", "7 days", "lite"), DO NOT treat it as a payment reference. Only evaluate transaction references when a full payment confirmation block is provided.
    - A VALID TRANSACTION REFERENCE MUST BE AT LEAST 7 CHARACTERS LONG. If a user provides a reference that is less than 7 characters as a payment code, reject it.
    - EXTRACTING THE TRANSACTION REFERENCE: Look for the longest alphanumeric string in the message. CODE_ENDING MUST be the EXACT last 7 characters of that full reference. Ignore punctuation like dots or dashes. NEVER accept or use a code shorter than 7 characters.
@@ -334,6 +335,29 @@ NO_GENUINE_PROOF_MESSAGE = (
     "everything in ONE message, using this format:\n\n"
     + ONE_MESSAGE_FORMAT +
     "\n\nPaste the ENTIRE EcoCash confirmation message, not just part of the approval code."
+)
+
+# Detects the model confirming/echoing a phone number back to the customer (e.g. "phone
+# number **392-8906**", "for phone number 0771234567") anywhere within ~40 characters of
+# the words "phone number". Used to catch the model treating an invalid or unverified
+# string (like a bare 7-digit input) as if it were a captured phone number, when Python's
+# own PHONE_PATTERN extraction found nothing valid.
+PHONE_LABEL_RE = re.compile(r'phone\s*number', re.IGNORECASE)
+CLAIMED_DIGIT_RUN_RE = re.compile(r'\+?\d[\d\s\-\u2010\u2011\u2012\u2013\u2014\u2015.]{5,}\d')
+
+def reply_claims_phone_number(reply_text):
+    if not reply_text:
+        return False
+    for m in PHONE_LABEL_RE.finditer(reply_text):
+        window = reply_text[m.end():m.end() + 40]
+        if CLAIMED_DIGIT_RUN_RE.search(window):
+            return True
+    return False
+
+INVALID_PHONE_MESSAGE = (
+    "I don't have a valid phone number on file for you yet. Please resend your Zimbabwean "
+    "mobile number - it must be exactly 10 digits starting with 071, 077, 078, or 079 "
+    "(e.g. 0771234567), or the same number in +263 format (e.g. +263771234567)."
 )
 
 def strip_fake_approval(reply, known_text=""):
@@ -1592,6 +1616,16 @@ def handle_customer_message(message):
         mentions_code_reference = bool(clean_reply) and (
             "code ending" in clean_reply.lower() or "approval code" in clean_reply.lower()
         )
+        # Same principle, applied to phone numbers: the model is only allowed to confirm/echo
+        # a phone number back to the customer if Python's own regex actually extracted a valid
+        # one THIS turn, or an earlier turn already confirmed one for this open transaction.
+        # Anything else (e.g. a bare 7-digit string the model mistook for a phone number) is
+        # the model inventing/accepting an unverified value, not a genuine capture.
+        genuine_phone_this_turn = bool(extracted_phone)
+        confirmed_phone_on_file = bool(
+            active_pending and active_pending.get("phone_confirmed") and active_pending.get("phone")
+        )
+        claims_phone = reply_claims_phone_number(clean_reply)
 
         if implies_new_receipt and not genuine_receipt_this_turn:
             print(f"[GUARD] Blocked a reply falsely claiming a NEW payment was just received for "
@@ -1612,6 +1646,12 @@ def handle_customer_message(message):
                     clean_reply,
                     flags=re.IGNORECASE
                 )
+
+        if claims_phone and not (genuine_phone_this_turn or confirmed_phone_on_file):
+            print(f"[GUARD] Blocked a reply that echoed/confirmed a phone number for {customer_key} "
+                  "with no Python-verified phone extracted this turn or on file - likely an "
+                  "invalid or hallucinated number.")
+            clean_reply = INVALID_PHONE_MESSAGE
 
         duplicate_notice = False
 
