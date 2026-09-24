@@ -1093,23 +1093,51 @@ def try_auto_approve(customer_key):
         return False
 
     # --- verification: package must exist and cost exactly what was paid ---
+    #
+    # A customer must NEVER be handed a package that costs MORE than what they actually
+    # paid (that's the business extending free credit / the customer "owing" the
+    # difference), and never LESS either (that would shortchange them). So if their
+    # requested package's price doesn't exactly equal what the registered proof says they
+    # paid, we don't deliver it as-is. Instead: if the amount they paid maps to exactly ONE
+    # package (PRICE_TO_PACKAGES), we reassign to THAT package automatically - the customer
+    # still gets a real voucher immediately, it's just guaranteed to be the one that
+    # actually matches what they paid, rather than what they happened to type. If the paid
+    # amount is ambiguous (shared by more than one package) or matches nothing at all, we
+    # still refuse to guess and fall back to manual review, exactly as before.
     pkg_key = info.get("package_key")
-    if not pkg_key:
+    reassigned_from = None
+    price_matches_requested = False
+    if pkg_key and pkg_key in PACKAGES:
+        try:
+            requested_price = f"{float(PACKAGES[pkg_key]['price'].replace('$', '')):.2f}"
+            price_matches_requested = (requested_price == proof["amount"])
+        except ValueError:
+            price_matches_requested = False
+
+    if not price_matches_requested:
         matches = PRICE_TO_PACKAGES.get(proof["amount"], [])
-        pkg_key = matches[0] if len(matches) == 1 else None  # ambiguous -> ask customer
+        matched_pkg = matches[0] if len(matches) == 1 else None
+        if not matched_pkg:
+            print(f"[AUTO] {customer_key}: paid {proof['amount']} but chose "
+                  f"{pkg_key or '(none)'} - no unambiguous package matches that amount - manual flow.")
+            return False
+        if pkg_key and pkg_key != matched_pkg:
+            reassigned_from = pkg_key
+        pkg_key = matched_pkg
+
     if not pkg_key or pkg_key not in PACKAGES:
-        return False
-    try:
-        pkg_price = f"{float(PACKAGES[pkg_key]['price'].replace('$', '')):.2f}"
-    except ValueError:
-        return False
-    if pkg_price != proof["amount"]:
-        print(f"[AUTO] {customer_key}: paid {proof['amount']} but chose {pkg_key} ({pkg_price}) - manual flow.")
         return False
 
     chat_id = customer_chat_id.get(customer_key)
     if chat_id is None:
         return False
+
+    # If a voucher was already reserved for the customer's ORIGINAL (mismatched) package
+    # choice, it belongs to a different package's stock now that we're reassigning - return
+    # it rather than handing it out under the wrong package.
+    if reassigned_from and info.get("proposed_code"):
+        return_voucher(info.get("package_key"), info["proposed_code"])
+        info["proposed_code"] = None
 
     # --- get a voucher (reuse one already reserved for this customer) -----
     reserved_here = not info.get("proposed_code")
@@ -1129,6 +1157,9 @@ def try_auto_approve(customer_key):
         f"✅ Your payment has been approved!\n\n"
         f"Package: {pkg_key}\n"
         f"Voucher code: {code}\n\n"
+        + (f"Note: your payment of ${proof['amount']} matches the {pkg_key} package, not the "
+           f"{reassigned_from} package you originally asked for - we've issued the package "
+           f"that matches what you actually paid.\n\n" if reassigned_from else "")
         + CLOSING_WARNING
     )
     try:
@@ -1160,7 +1191,9 @@ def try_auto_approve(customer_key):
                 f"Customer: {label}\n"
                 f"Ref ending: {fp}  |  Paid: ${proof['amount']}"
                 + (f" ({_party_text(proof).strip()})" if proof.get("sender") else "") + "\n"
-                f"Package: {pkg_key}\n"
+                f"Package: {pkg_key}"
+                + (f" (customer asked for {reassigned_from}; reassigned to match the amount paid)"
+                   if reassigned_from else "") + "\n"
                 f"Voucher sent: {code}\n"
                 f"The registered proof was removed from memory."
             )
