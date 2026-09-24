@@ -88,6 +88,9 @@ user_last_message_id = {}
 customer_chat_id = {}       
 customer_display = {}       
 customer_last_code = {}     
+customer_last_phone = {}    # customer_key -> last Python-VERIFIED phone number (persists across
+                             # turns even before a payment reference exists, so a legitimately
+                             # provided phone isn't forgotten by the time proof of payment arrives)
 admin_chat_id = None
 
 # ==========================================
@@ -152,6 +155,7 @@ def save_state():
         "customer_chat_id": customer_chat_id,
         "customer_display": customer_display,
         "customer_last_code": customer_last_code,
+        "customer_last_phone": customer_last_phone,
         "voucher_inventory": voucher_inventory,
         "used_payment_refs": sorted(used_payment_refs),
         "admin_chat_id": admin_chat_id,
@@ -179,6 +183,7 @@ def load_state():
         customer_chat_id.update(snapshot.get("customer_chat_id", {}))
         customer_display.update(snapshot.get("customer_display", {}))
         customer_last_code.update(snapshot.get("customer_last_code", {}))
+        customer_last_phone.update(snapshot.get("customer_last_phone", {}))
         used_payment_refs.update(snapshot.get("used_payment_refs", []))
         for pkg, codes in snapshot.get("voucher_inventory", {}).items():
             voucher_inventory[pkg] = codes
@@ -355,10 +360,42 @@ def reply_claims_phone_number(reply_text):
     return False
 
 INVALID_PHONE_MESSAGE = (
-    "I don't have a valid phone number on file for you yet. Please resend your Zimbabwean "
-    "mobile number - it must be exactly 10 digits starting with 071, 077, 078, or 079 "
-    "(e.g. 0771234567), or the same number in +263 format (e.g. +263771234567)."
+    "I want to double-check your phone number before we go further. Please resend your "
+    "Zimbabwean mobile number so I can confirm it - it must be exactly 10 digits starting "
+    "with 071, 077, 078, or 079 (e.g. 0771234567), or the same number in +263 format "
+    "(e.g. +263771234567)."
 )
+
+def normalize_phone(num):
+    """Canonical local 10-digit form (e.g. '0771234567') for comparing two phone numbers
+    regardless of whether they were written with a leading 0 or +263. Returns None if the
+    value isn't a well-formed 10-digit Zimbabwean number once normalized."""
+    if not num:
+        return None
+    digits = re.sub(r'\D', '', num)
+    if digits.startswith('263') and len(digits) == 12:
+        digits = '0' + digits[3:]
+    return digits if len(digits) == 10 else None
+
+def reply_contains_mismatched_phone(reply_text, known_phone):
+    """Phrasing-INDEPENDENT check: scans the whole reply for anything shaped like a real,
+    well-formed Zimbabwean number (via the same strict PHONE_PATTERN used for extraction),
+    regardless of whether the words "phone number" appear anywhere near it. If a match is
+    found that doesn't equal the one number we've actually verified for this customer (or
+    nothing has been verified yet), that's the model asserting a phone number with zero
+    Python-side backing - exactly the failure mode that a label-only check can't catch when
+    the model phrases it as e.g. "package for 0776543324" instead of "phone number: ...".
+    Skips numbers that are clearly just illustrative examples (preceded by "e.g."/"example")."""
+    if not reply_text:
+        return False
+    known_norm = normalize_phone(known_phone)
+    for m in PHONE_PATTERN.finditer(reply_text):
+        prefix = reply_text[max(0, m.start() - 15):m.start()].lower()
+        if 'e.g' in prefix or 'example' in prefix:
+            continue
+        if normalize_phone(m.group(1)) != known_norm:
+            return True
+    return False
 
 def strip_fake_approval(reply, known_text=""):
     if not reply:
@@ -973,6 +1010,48 @@ def probable_match_note(code_ending):
     )
 
 
+# --- Bare, unlabeled digit-only messages (e.g. a customer just sending "3928909" with no
+# "Approval Code:" / "Ref:" label at all) are NOT treated as a confirmed transaction
+# reference - extract_code_ending_from_text still requires a label for that, and nothing
+# here changes that. This is a SEPARATE, strictly advisory feature: if such a bare number
+# happens to share a fingerprint with something the admin already registered, we give the
+# admin an early heads-up so they can follow up proactively. It never creates a
+# pending_approvals entry, never sets alert_sent, and never triggers try_auto_approve - the
+# customer still has to paste the FULL proof of payment for anything to actually happen.
+BARE_DIGIT_RE = re.compile(r'^[\s.\-:,]*(\d{7,15})[\s.\-:,]*$')
+BARE_DIGIT_NOTIFY_COOLDOWN_SECONDS = 60
+_bare_digit_last_notify = {}
+
+def extract_bare_digit_candidate(text):
+    if not text:
+        return None
+    m = BARE_DIGIT_RE.match(text.strip())
+    return m.group(1) if m else None
+
+def maybe_notify_admin_of_bare_digit_match(customer_key, bare_digits, label):
+    """Read-only, advisory ONLY. Returns True if a heads-up was sent."""
+    fp, proof = find_probable_match(bare_digits)
+    if not proof:
+        return False  # nothing registered with this fingerprint - nothing to say
+    now = time.time()
+    if now - _bare_digit_last_notify.get(customer_key, 0) < BARE_DIGIT_NOTIFY_COOLDOWN_SECONDS:
+        return False  # already flagged recently, don't spam the admin
+    _bare_digit_last_notify[customer_key] = now
+    if admin_chat_id:
+        try:
+            admin_bot.send_message(
+                admin_chat_id,
+                f"👀 Heads up: {label} sent a bare number ending in {fp}, which matches a "
+                f"registered proof on file (${proof['amount']}{_party_text(proof)}).\n"
+                "They have NOT sent the full proof of payment yet, so nothing has been "
+                "approved or reserved - purely an early FYI in case you want to follow up.\n"
+                f"🗑️ Not a match? /matchreject_{fp}"
+            )
+        except Exception as e:
+            print(f"[BARE-DIGIT] Could not notify admin: {e}")
+    return True
+
+
 def try_auto_approve(customer_key):
     """Returns True only if a voucher was delivered. Returns False (touching nothing)
     whenever anything doesn't line up, so the normal manual flow takes over."""
@@ -1375,6 +1454,23 @@ def handle_customer_message(message):
     extracted_phone = extract_phone_from_message(text)
     extracted_pkg = extract_package_from_message(text)
 
+    # Advisory-only: a bare digit-only message (no label at all, so it is NOT a confirmed
+    # reference) may still be worth flagging to the admin if it happens to match something
+    # already registered. This never creates pending_approvals state and never approves
+    # anything - the customer conversation below proceeds completely unaffected.
+    if not extracted_ref and not extracted_phone and not extracted_pkg:
+        bare_digits = extract_bare_digit_candidate(text)
+        if bare_digits:
+            maybe_notify_admin_of_bare_digit_match(
+                customer_key, bare_digits, customer_display.get(customer_key, customer_key)
+            )
+
+    # Remember any genuinely-extracted phone number immediately, even if no payment
+    # reference has arrived yet - otherwise a phone given in an earlier, separate message
+    # is invisible to the reply-guard below by the time the customer later sends proof.
+    if extracted_phone:
+        customer_last_phone[customer_key] = extracted_phone
+
     # Make sure conversation memory exists before we possibly inject a system note below.
     if customer_key not in user_memory:
         user_memory[customer_key] = [{"role": "system", "content": system_rules}]
@@ -1618,14 +1714,20 @@ def handle_customer_message(message):
         )
         # Same principle, applied to phone numbers: the model is only allowed to confirm/echo
         # a phone number back to the customer if Python's own regex actually extracted a valid
-        # one THIS turn, or an earlier turn already confirmed one for this open transaction.
-        # Anything else (e.g. a bare 7-digit string the model mistook for a phone number) is
-        # the model inventing/accepting an unverified value, not a genuine capture.
-        genuine_phone_this_turn = bool(extracted_phone)
-        confirmed_phone_on_file = bool(
-            active_pending and active_pending.get("phone_confirmed") and active_pending.get("phone")
+        # one THIS turn, or an earlier turn already gave us one for this customer. Two checks:
+        # (1) a label-based scan ("phone number" + a nearby digit run, however malformed) -
+        #     catches things like the model inventing "phone number 392-8906" out of a bare
+        #     7-digit input; and (2) a phrasing-INDEPENDENT scan for anything shaped like a
+        #     real, well-formed number anywhere in the reply, compared against the one number
+        #     we've actually verified - catches the model omitting the label entirely (e.g.
+        #     "package for 0776543324"), which (1) alone cannot detect.
+        known_genuine_phone = (
+            extracted_phone
+            or (active_pending or {}).get("phone")
+            or customer_last_phone.get(customer_key)
         )
-        claims_phone = reply_claims_phone_number(clean_reply)
+        claims_phone_label = reply_claims_phone_number(clean_reply) and not known_genuine_phone
+        claims_mismatched_phone = reply_contains_mismatched_phone(clean_reply, known_genuine_phone)
 
         if implies_new_receipt and not genuine_receipt_this_turn:
             print(f"[GUARD] Blocked a reply falsely claiming a NEW payment was just received for "
@@ -1647,9 +1749,9 @@ def handle_customer_message(message):
                     flags=re.IGNORECASE
                 )
 
-        if claims_phone and not (genuine_phone_this_turn or confirmed_phone_on_file):
+        if claims_phone_label or claims_mismatched_phone:
             print(f"[GUARD] Blocked a reply that echoed/confirmed a phone number for {customer_key} "
-                  "with no Python-verified phone extracted this turn or on file - likely an "
+                  "with no matching Python-verified phone this turn or on file - likely an "
                   "invalid or hallucinated number.")
             clean_reply = INVALID_PHONE_MESSAGE
 
