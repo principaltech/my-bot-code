@@ -248,9 +248,9 @@ You are an automated customer care AI assistant for Splash Internet. You MUST fo
    - $5 = Unlimited 14d = USD $5.00 = UNLIMITED
    - $10 = Unlimited 30d = USD $10.00 = UNLIMITED
 3. PAYMENTS & PROOF OF PAYMENT:
-   - EcoCash number is 0776248396.
+   - EcoCash number is 0776248396. Customers can also click the price of a package on the login portal and process the payment to Splash there.
    - You only need proof of payment. The backend detects the package from the amount and does NOT need a phone number unless the payment takes long.
-   - PHONE NUMBER FORMAT: A valid Zimbabwean mobile number is exactly 10 digits starting with 071, 077, 078, or 079 (e.g. 0771234567), or the same number in +263 format (e.g. +263771234567). This is a SEPARATE rule from the transaction reference length below - do not confuse the two. If the customer's phone number is missing digits, has the wrong prefix, or is otherwise not in this format, ask them to resend it correctly. NEVER treat a 7-digit string as a valid phone number.
+   - PHONE NUMBER FORMAT: A valid Zimbabwean mobile number is exactly 10 digits starting with 071, 077, 078, or 079 (e.g. 0776248396), or the same number in +263 format (e.g. +263776248396). This is a SEPARATE rule from the transaction reference length below - do not confuse the two. If the customer's phone number is missing digits, has the wrong prefix, or is otherwise not in this format, ask them to resend it correctly. NEVER treat a 7-digit string as a valid phone number.
    - DISTINGUISH REPLIES: If the user is just answering a question about which package they want (e.g. saying "7d", "7 days", "lite"), DO NOT treat it as a payment reference. Only evaluate transaction references when a full payment confirmation block is provided.
    - A VALID TRANSACTION REFERENCE MUST BE AT LEAST 7 CHARACTERS LONG. If a user provides a reference that is less than 7 characters as a payment code, reject it.
    - EXTRACTING THE TRANSACTION REFERENCE: Look for the longest alphanumeric string in the message. CODE_ENDING MUST be the EXACT last 7 characters of that full reference. Ignore punctuation like dots or dashes. NEVER accept or use a code shorter than 7 characters.
@@ -279,7 +279,40 @@ You are an automated customer care AI assistant for Splash Internet. You MUST fo
    - Tell them to paste the ENTIRE EcoCash confirmation message (the whole "Transfer Confirmation: ... Approval Code: ... New balance: ..." text), NOT just the last digits of the approval code. The backend reads the full approval code and the amount from it, detects the package from the amount, and compares it with our records.
    - If the customer sends only part of the code, politely ask them to paste the FULL proof of payment.
    - Do NOT ask for a phone number or package up front.
+13. WHERE TO PAY:
+   - If the customer asks for the EcoCash number, where to pay, or how to pay, tell them to process their EcoCash payment to 0776248396, OR alternatively to click the price of the package they want on the login portal and pay to Splash. Then tell them to paste the FULL proof of payment. Use 0776248396 in any phone number examples.
 """
+
+# ==========================================
+# BUSINESS PAYMENT NUMBER + "WHERE DO I PAY?" AUTO-REPLY
+# ==========================================
+BUSINESS_NUMBER = "0776248396"
+BUSINESS_NUMBER_INTL = "+263776248396"
+
+PAYMENT_INFO_MESSAGE = (
+    f"To pay, send your EcoCash payment to {BUSINESS_NUMBER} (Splash Internet).\n\n"
+    "Or, even simpler: on the login portal, click the price of the package you want "
+    "and process the payment to Splash from there.\n\n"
+    "After paying, paste the FULL proof of payment (the entire EcoCash confirmation "
+    "message) here using this format:\n\n"
+    "Paste Full Proof of payment:"
+)
+
+PAY_WHERE_RE = re.compile(
+    r"eco\s*-?\s*cash\s*(number|no\b|num)"
+    r"|(what|which|whats|what's)\s*(is\s*)?(the\s*|your\s*|ur\s*)?(number|no\b)"
+    r"|where\s*(do|can|should|must|to)\s*(i\s*|we\s*)?(pay|send|deposit)"
+    r"|how\s*(do|can|to|should)\s*(i\s*|we\s*)?pay"
+    r"|payment\s*(number|details|info|method)"
+    r"|send\s*(money|payment)\s*to"
+    r"|(number|namba)\s*(to|yekubhadhara|for)\s*(pay|payment)?",
+    re.IGNORECASE
+)
+
+def asks_where_to_pay(text):
+    if not text or PROOF_MARKER_RE.search(text):
+        return False
+    return bool(PAY_WHERE_RE.search(text))
 
 WAIT_MESSAGE = "Thank you, we have received your payment proof. Please wait about 30 seconds while we validate the payment."
 ONE_MESSAGE_FORMAT = "Paste Full Proof of payment:"
@@ -303,7 +336,8 @@ def build_welcome_message():
     return (
         "👋 Welcome to Splash Internet!\n\n"
         "Packages:\n" + "\n".join(lines) + "\n\n"
-        "Pay via EcoCash to 0776248396, then just paste the ENTIRE EcoCash confirmation message "
+        f"Pay via EcoCash to {BUSINESS_NUMBER}, or simply click the price of your package on the "
+        "login portal and pay to Splash. Then paste the ENTIRE EcoCash confirmation message "
         "(from \"Transfer Confirmation\" to the end) here. Your package is detected automatically "
         "from the amount you paid."
     )
@@ -313,8 +347,11 @@ PHONE_PATTERN = re.compile(r'\b(0(?:71|77|78|79)\d{7}|\+?263(?:71|77|78|79)\d{7}
 def extract_phone_from_text(text):
     if not text:
         return None
-    m = PHONE_PATTERN.search(text)
-    return m.group(1) if m else None
+    for m in PHONE_PATTERN.finditer(text):
+        if normalize_phone(m.group(1)) == normalize_phone(BUSINESS_NUMBER):
+            continue  # that's OUR EcoCash number, not the customer's
+        return m.group(1)
+    return None
 
 FAKE_APPROVAL_RE = re.compile(
     r'(?:payment\s+(?:has\s+been|was|is|is\s+now)\s+(?:approved|verified|confirmed|successful))'
@@ -359,8 +396,8 @@ def reply_claims_phone_number(reply_text):
 INVALID_PHONE_MESSAGE = (
     "I want to double-check your phone number before we go further. Please resend your "
     "Zimbabwean mobile number so I can confirm it - it must be exactly 10 digits starting "
-    "with 071, 077, 078, or 079 (e.g. 0771234567), or the same number in +263 format "
-    "(e.g. +263771234567)."
+    "with 071, 077, 078, or 079 (e.g. 0776248396), or the same number in +263 format "
+    "(e.g. +263776248396)."
 )
 
 def normalize_phone(num):
@@ -390,6 +427,8 @@ def reply_contains_mismatched_phone(reply_text, known_phone):
         prefix = reply_text[max(0, m.start() - 15):m.start()].lower()
         if 'e.g' in prefix or 'example' in prefix:
             continue
+        if normalize_phone(m.group(1)) == normalize_phone(BUSINESS_NUMBER):
+            continue  # our own payment number is always allowed
         if normalize_phone(m.group(1)) != known_norm:
             return True
     return False
@@ -1605,7 +1644,7 @@ def reply_pending_status(message, customer_key, text):
     if needs_phone(info, text):
         info["phone_asked"] = time.time()
         reply += ("\n\nTo help us speed this up, please also send your phone number "
-                  "(e.g. 0771234567).")
+                  "(e.g. 0776248396).")
     _send_reply(message, customer_key, reply, text)
     return True
 
@@ -1663,7 +1702,7 @@ def alert_admin_for_pending(message, customer_key, pkg, amount, proof, partial, 
     if not proof and not info.get("phone"):
         info["phone_asked"] = time.time()   # stops the watchdog from asking a second time
         reply += ("\n\nSince we're verifying this payment manually, please also send your "
-                  "phone number (e.g. 0771234567).")
+                  "phone number (e.g. 0776248396).")
     _send_reply(message, customer_key, reply, text)
     return True
 
@@ -1733,7 +1772,7 @@ def run_phone_watchdog():
                 changed = True
                 msg = ensure_closing_warning(
                     "Sorry for the wait - your payment is still being verified. To help us speed "
-                    "things up, please send your phone number (e.g. 0771234567).")
+                    "things up, please send your phone number (e.g. 0776248396).")
                 try:
                     customer_bot.send_message(chat_id, msg)
                     user_memory.setdefault(key, [{"role": "system", "content": system_rules}]) \
@@ -1797,6 +1836,12 @@ def handle_customer_message(message):
     # Make sure conversation memory exists before we possibly inject a system note below.
     if customer_key not in user_memory:
         user_memory[customer_key] = [{"role": "system", "content": system_rules}]
+
+    # "Where do I pay / what's the EcoCash number?" -> fixed, deterministic answer (no AI).
+    # Never fires when the message contains a real proof (Approval Code / Transfer Confirmation).
+    if not extracted_ref and asks_where_to_pay(text):
+        _send_reply(message, customer_key, PAYMENT_INFO_MESSAGE, text)
+        return
 
     # If this is just a status follow-up on an already-open, already-alerted
     # transaction (no fresh reference this turn), answer from real state and
@@ -2639,7 +2684,7 @@ def run_admin_bot():
 
 if __name__ == "__main__":
     import sys
-    print("[VERSION] splash_bot.py — smart payment fast-path (price-based package, no up-front phone) + auto stock reservation + YES-on-unreserved fix + Intergram reconnect + pre-registered proof auto-approval", flush=True)
+    print("[VERSION] splash_bot.py — smart payment fast-path (price-based package, no up-front phone) + auto stock reservation + YES-on-unreserved fix + Intergram reconnect + pre-registered proof auto-approval + where-to-pay auto-reply", flush=True)
     load_state()
     print(f"[Groq] Loaded {len(groq_clients)} API key(s) for rotation/fallback.", flush=True)
     print(f"[AUTO] Auto-approval {'ENABLED' if AUTO_APPROVE_ENABLED else 'DISABLED'} "
