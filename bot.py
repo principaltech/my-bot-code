@@ -1340,16 +1340,18 @@ def handle_proof_admin_message(text):
 # "y6ysyx: Hi" - everything up to the first ":" is the tag/username, everything
 # after it is the actual customer message.
 #
-# CONFIRMED: this tag is NOT a stable, session-surviving identity key - it
-# changes together with chat_id whenever the customer leaves and reopens the
-# widget chat. So a genuinely returning customer shows up with a brand-new tag
-# that was never seen before, and a lookup against the old one will simply
-# miss. It's kept below only as a harmless, zero-cost, best-effort check (in
-# case some sessions don't fully reset it) - never as the primary signal.
+# Per Prince: this tag is emitted at the very start of every forwarded message,
+# up to the first ":", and it changes together with chat_id whenever the
+# customer leaves and reopens the widget chat - i.e. it tracks the SAME session
+# boundary as chat_id itself. Because of that it is checked FIRST below (it's
+# the most specific signal we have for "this is the same visitor session"), with
+# phone number as the fallback when no tag match is found - phone is what
+# actually survives a genuine session reset, since a brand-new session always
+# produces a brand-new, never-before-seen tag.
 #
-# The PHONE NUMBER is the only thing that actually survives a session reset,
-# so it - together with the single-open-transaction fallback - is what
-# reconciliation is really built on.
+# extract_intergram_tag() below splits every incoming message into (tag,
+# message_without_tag) so downstream regexes (phone/reference/package
+# extraction) always see clean customer text either way.
 
 REBUMP_COOLDOWN_SECONDS = 15  # just enough to absorb accidental double-sends/webhook retries,
                                # not to make an impatient customer wait for a re-alert
@@ -1362,10 +1364,10 @@ FOLLOWUP_STATUS_RE = re.compile(
     re.IGNORECASE
 )
 
-# ASSUMPTION based on the two examples you gave ("cdgrmv:", "y6ysyx:"): the tag
-# is exactly 6 lowercase letters/digits. If your Intergram config uses a
-# different length or includes uppercase, adjust {6} and the character class
-# below to match - check a few real forwarded messages to confirm the format.
+# ASSUMPTION based on the two examples you gave ("cdgrmv:", "y6ysyx:", "tzb3bi:"): the tag
+# is exactly 6 lowercase letters/digits, followed by ":" and then the message. If your
+# Intergram config uses a different length or includes uppercase, adjust {6} and the
+# character class below to match - check a few real forwarded messages to confirm the format.
 INTERGRAM_TAG_RE = re.compile(r'^([a-z0-9]{6}):\s?(.*)$', re.IGNORECASE | re.DOTALL)
 
 def extract_intergram_tag(raw_text):
@@ -1423,19 +1425,22 @@ def reconcile_returning_customer(message, chat_customer_key, raw_text):
     Priority, strongest signal first:
       1. This exact chat_customer_key already has an open record - nothing to
          reconcile.
-      2. A phone number in the message matching an open pending approval -
-         this is the signal that actually survives a widget/session reset.
-         (Intergram's per-visitor tag does NOT survive a reset - it changes
-         together with chat_id - so it can't do this job; see the comment on
-         intergram_tag_to_key above.)
-      3. Exactly ONE open, already-alerted transaction system-wide and this
+      2. Intergram's per-visitor tag (e.g. "tzb3bi:") matching a key we've
+         already seen that tag paired with. Checked FIRST per Prince's
+         instruction - the tag is the most specific same-session signal we
+         have. NOTE: it changes together with chat_id on a genuine session
+         reset, so it can only ever match within a session we've already
+         recorded the tag for (e.g. a retried/duplicate webhook delivery, or
+         a message arriving before we'd finished routing an earlier one) -
+         it will NOT bridge an actual reset. Phone (below) is what bridges
+         a real reset.
+      3. A phone number in the message matching an open pending approval -
+         the signal that actually survives a widget/session reset, since a
+         new session always produces a brand-new, never-seen tag.
+      4. Exactly ONE open, already-alerted transaction system-wide and this
          message reads like a status follow-up (last-resort, single-customer
          only - never guessed when more than one customer is waiting, since a
          wrong guess would leak/misroute someone else's transaction).
-      4. Intergram's tag, as a last-ditch, best-effort check only - kept in
-         case some sessions don't fully reset it. Never relied on for
-         correctness; if it happens to hit, great, but the paths above are
-         what actually make reconciliation work.
 
     Returns (canonical_key, cleaned_text).
     """
@@ -1446,20 +1451,26 @@ def reconcile_returning_customer(message, chat_customer_key, raw_text):
             intergram_tag_to_key[tag] = chat_customer_key
         return chat_customer_key, cleaned_text
 
-    phone = extract_phone_from_text(cleaned_text)
-    old_key = find_pending_by_phone(phone) if phone else None
+    old_key = None
 
-    if not old_key and len(pending_approvals) == 1 and FOLLOWUP_STATUS_RE.search(cleaned_text or ""):
-        only_key, only_info = next(iter(pending_approvals.items()))
-        if only_info.get("alert_sent"):
-            old_key = only_key
-
-    if not old_key and tag:
+    # Priority 1: Intergram tag match.
+    if tag:
         known_key = intergram_tag_to_key.get(tag)
         if known_key and known_key != chat_customer_key and (
             known_key in pending_approvals or known_key in user_memory
         ):
             old_key = known_key
+
+    # Priority 2: phone number match (survives a genuine session reset, unlike the tag).
+    if not old_key:
+        phone = extract_phone_from_text(cleaned_text)
+        old_key = find_pending_by_phone(phone) if phone else None
+
+    # Priority 3: single open + already-alerted transaction, follow-up wording.
+    if not old_key and len(pending_approvals) == 1 and FOLLOWUP_STATUS_RE.search(cleaned_text or ""):
+        only_key, only_info = next(iter(pending_approvals.items()))
+        if only_info.get("alert_sent"):
+            old_key = only_key
 
     if tag:
         # Remember this tag -> key pairing regardless of whether it helped just
@@ -2749,7 +2760,7 @@ def run_admin_bot():
 
 if __name__ == "__main__":
     import sys
-    print("[VERSION] splash_bot.py — smart payment fast-path (price-based package, no up-front phone) + auto stock reservation + YES-on-unreserved fix + Intergram reconnect + pre-registered proof auto-approval + where-to-pay auto-reply", flush=True)
+    print("[VERSION] splash_bot.py — smart payment fast-path (price-based package, no up-front phone) + auto stock reservation + YES-on-unreserved fix + Intergram reconnect (tag-first, phone-fallback) + pre-registered proof auto-approval + where-to-pay auto-reply", flush=True)
     load_state()
     print(f"[Groq] Loaded {len(groq_clients)} API key(s) for rotation/fallback.", flush=True)
     print(f"[AUTO] Auto-approval {'ENABLED' if AUTO_APPROVE_ENABLED else 'DISABLED'} "
