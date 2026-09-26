@@ -1070,16 +1070,45 @@ def find_probable_match(code_ending):
         return fp, registered_proofs.get(fp)
 
 
-def probable_match_note(code_ending):
+def diagnose_mismatch(pending_info, proof):
+    """Returns a short, specific, human-readable reason a registered proof's fingerprint
+    matched but try_auto_approve() still refused to auto-send - so the admin doesn't have
+    to go dig through server logs to find out why. Checked in the same order
+    try_auto_approve() itself checks them."""
+    pending_info = pending_info or {}
+
+    claimed_ref = normalize_ref(pending_info.get("claimed_ref"))
+    claimed_amount = pending_info.get("claimed_amount")
+    if len(claimed_ref) <= 7 or not claimed_amount:
+        return "customer has not pasted the FULL proof of payment yet (only a partial reference)"
+
+    claimed_core = (pending_info.get("claimed_core") or "").upper()
+    reg_core = (proof.get("core_ref") or "").upper()
+    if reg_core and claimed_core and claimed_core != reg_core:
+        return (f"full reference differs beyond the shared last 7 characters "
+                f"(customer's: ...{claimed_core}, registered: ...{reg_core})")
+
+    reg_amount = proof.get("amount")
+    if claimed_amount != reg_amount:
+        return f"amount differs (customer's proof: ${claimed_amount}, registered: ${reg_amount})"
+
+    return "reference/amount could not be fully verified"
+
+
+def probable_match_note(code_ending, pending_info=None):
     """One-line note to append to an admin alert/reminder if a registered proof
-    shares this code ending's fingerprint. Returns '' if there's no candidate."""
+    shares this code ending's fingerprint. Returns '' if there's no candidate.
+    When pending_info (the customer's pending_approvals record) is supplied, the
+    note names the SPECIFIC reason auto-approval didn't fire instead of a generic
+    "full code or amount didn't line up" - see diagnose_mismatch()."""
     fp, proof = find_probable_match(code_ending)
     if not proof:
         return ""
+    reason = diagnose_mismatch(pending_info, proof)
     return (
         f"\n\n💡 Possible match on file: ${proof['amount']}{_party_text(proof)}, "
         f"ref ending {fp} (registered {int(time.time() - proof['registered_at'])}s ago). "
-        "This did NOT auto-approve (full code or amount didn't line up) - please compare "
+        f"This did NOT auto-approve ({reason}) - please compare "
         "against what the customer sent before replying YES.\n"
         f"🗑️ Not a match? Tap to remove it: /matchreject_{fp}"
     )
@@ -1556,7 +1585,7 @@ def reserve_stock_for_waiting(only_package=None, notify=True):
                     f"(code ending {info.get('code_ending')}, {pk}).\n"
                     f"Stored voucher reserved: {code}\n"
                     "Reply YES to send it to the customer, or NO to hold it and provide a different code."
-                    + probable_match_note(info.get("code_ending"))
+                    + probable_match_note(info.get("code_ending"), info)
                 )
             except Exception as e:
                 print(f"[STOCK] Could not notify admin: {e}")
@@ -1591,7 +1620,7 @@ def maybe_bump_admin_for_pending(customer_key, text, label):
         info["last_alert_time"] = now
         return True   # the helper already sent the "stock is now available" message
 
-    note = probable_match_note(info.get("code_ending"))
+    note = probable_match_note(info.get("code_ending"), info)
 
     if admin_chat_id:
         if info.get("proposed_code"):
@@ -1777,7 +1806,7 @@ def alert_admin_for_pending(message, customer_key, pkg, amount, proof, partial, 
                  "Customer sent ONLY the last digits (not the full proof).\n")
         note = f"\n🗑️ Not a match? /matchreject_{fp}"
     elif proof:
-        basis, note = "", probable_match_note(ending)
+        basis, note = "", probable_match_note(ending, info)
     else:
         basis, note = "⚠️ No registered proof on file for this reference - verify manually.\n", ""
 
@@ -2261,7 +2290,7 @@ def handle_customer_message(message):
                                 f"Package: {parsed['package']}\n\n"
                                 f"Stored voucher found: {reserved_code}\n"
                                 f"Reply YES to send it to the customer, or NO to hold it and provide a different code."
-                                + probable_match_note(parsed['code_ending'])
+                                + probable_match_note(parsed['code_ending'], pending_approvals.get(customer_key))
                             )
                         else:
                             admin_msg = (
@@ -2272,7 +2301,7 @@ def handle_customer_message(message):
                                 f"Phone: {parsed['phone']}\n"
                                 f"Package: {parsed['package']}\n\n"
                                 f"No stored code for this package. Reply with a new voucher code to approve, or 'no' to reject."
-                                + probable_match_note(parsed['code_ending'])
+                                + probable_match_note(parsed['code_ending'], pending_approvals.get(customer_key))
                             )
                     else:
                         if customer_key in pending_approvals and pending_approvals[customer_key].get("alert_sent"):
@@ -2285,7 +2314,7 @@ def handle_customer_message(message):
                             "last_alert_time": time.time(),
                         }
                         admin_msg = (f"🔔 ADMIN ALERT (Customer: {label}):\n{alert_text}"
-                                      + probable_match_note(fallback_ending))
+                                      + probable_match_note(fallback_ending, pending_approvals.get(customer_key)))
                     admin_bot.send_message(admin_chat_id, admin_msg)
             else:
                 clean_reply += "\n\n⚠️ SYSTEM NOTIFICATION: The Admin Bot is currently unlinked. (Admin: Please send /start to the Admin bot to reconnect routing)."
@@ -2801,7 +2830,7 @@ def run_admin_bot():
 
 if __name__ == "__main__":
     import sys
-    print("[VERSION] splash_bot.py — smart payment fast-path (price-based package, no up-front phone) + auto stock reservation + YES-on-unreserved fix + Intergram reconnect (tag-first, phone-fallback) + pre-registered proof auto-approval + where-to-pay auto-reply", flush=True)
+    print("[VERSION] splash_bot.py — smart payment fast-path (price-based package, no up-front phone) + auto stock reservation + YES-on-unreserved fix + Intergram reconnect (tag-first, phone-fallback) + pre-registered proof auto-approval + where-to-pay auto-reply + specific mismatch reasons in admin notes", flush=True)
     load_state()
     print(f"[Groq] Loaded {len(groq_clients)} API key(s) for rotation/fallback.", flush=True)
     print(f"[AUTO] Auto-approval {'ENABLED' if AUTO_APPROVE_ENABLED else 'DISABLED'} "
