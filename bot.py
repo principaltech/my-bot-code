@@ -211,11 +211,18 @@ def display_name_for(message):
 pending_approvals = {}
 used_payment_refs = set()
 
-# Maps Intergram's stable per-visitor tag (the short code Intergram prefixes onto
-# every forwarded message, e.g. "y6ysyx: Hi") to whichever customer_key currently
-# holds that visitor's record. Unlike chat_id, this tag does NOT change when the
-# widget session resets, so it's the right thing to key returning-customer
-# identity on.
+# Maps Intergram's per-visitor tag (the short label Intergram prefixes onto every
+# forwarded message, e.g. "y6ysyx: Hi" - everything up to the first ":" is the
+# tag, everything after it is the actual customer message) to whichever
+# customer_key last used that tag.
+#
+# CONFIRMED: this tag changes together with chat_id whenever the customer
+# leaves/reopens the widget chat - it behaves like chat_id itself, not like a
+# persistent visitor id. So it can't reliably identify a returning customer
+# across a session reset (a new session means a brand-new, never-seen tag).
+# Kept only as a harmless, best-effort fallback - see reconcile_returning_customer()
+# below, which tries the phone number FIRST because that's the signal that
+# actually survives a reset.
 intergram_tag_to_key = {}
 
 admin_awaiting = {}
@@ -281,6 +288,9 @@ You are an automated customer care AI assistant for Splash Internet. You MUST fo
    - Do NOT ask for a phone number or package up front.
 13. WHERE TO PAY:
    - If the customer asks for the EcoCash number, where to pay, or how to pay, tell them to process their EcoCash payment to 0776248396, OR alternatively to click the price of the package they want on the login portal and pay to Splash. Then tell them to paste the FULL proof of payment. Use 0776248396 in any phone number examples.
+14. PHONE NUMBER TIMING (DO NOT IMPROVISE THIS):
+   - NEVER ask the customer for their phone number on your own initiative. The backend decides exactly when a phone number is actually needed and will tell you via an explicit SYSTEM NOTE when that's the case. If you don't see such a note, do not bring up the phone number at all, even if you think it would help speed things along.
+   - Likewise, never tell the customer "you'd like package X" or otherwise confirm a package choice based on a vague or partial message (like a stray data amount or a cut-off sentence). If you are not certain which package they mean, ask them to reply with just the package name.
 """
 
 # ==========================================
@@ -1326,11 +1336,20 @@ def handle_proof_admin_message(text):
 # stranger even though their earlier payment proof is still sitting, unresolved,
 # in pending_approvals under their OLD key.
 #
-# The reliable fix: Intergram prefixes every forwarded message with a short,
-# STABLE per-visitor tag, e.g. "y6ysyx: Hi" - that tag does NOT change when the
-# chat_id does, so it's the correct identity key, not chat_id and not phone
-# number. Phone-number matching (and the single-pending fallback) is kept as a
-# secondary safety net for the rare message that doesn't carry a tag.
+# Intergram prefixes every forwarded message with a short per-visitor tag, e.g.
+# "y6ysyx: Hi" - everything up to the first ":" is the tag/username, everything
+# after it is the actual customer message.
+#
+# CONFIRMED: this tag is NOT a stable, session-surviving identity key - it
+# changes together with chat_id whenever the customer leaves and reopens the
+# widget chat. So a genuinely returning customer shows up with a brand-new tag
+# that was never seen before, and a lookup against the old one will simply
+# miss. It's kept below only as a harmless, zero-cost, best-effort check (in
+# case some sessions don't fully reset it) - never as the primary signal.
+#
+# The PHONE NUMBER is the only thing that actually survives a session reset,
+# so it - together with the single-open-transaction fallback - is what
+# reconciliation is really built on.
 
 REBUMP_COOLDOWN_SECONDS = 15  # just enough to absorb accidental double-sends/webhook retries,
                                # not to make an impatient customer wait for a re-alert
@@ -1402,34 +1421,29 @@ def reconcile_returning_customer(message, chat_customer_key, raw_text):
     (phone/reference/package extraction) see clean customer text.
 
     Priority, strongest signal first:
-      1. Intergram's stable per-visitor tag - trusted on its own, even with
-         zero other info in the message (fixes "hi" / "resend" / "still
-         waiting" with nothing else in it).
-      2. A phone number in the message matching an open pending approval.
+      1. This exact chat_customer_key already has an open record - nothing to
+         reconcile.
+      2. A phone number in the message matching an open pending approval -
+         this is the signal that actually survives a widget/session reset.
+         (Intergram's per-visitor tag does NOT survive a reset - it changes
+         together with chat_id - so it can't do this job; see the comment on
+         intergram_tag_to_key above.)
       3. Exactly ONE open, already-alerted transaction system-wide and this
          message reads like a status follow-up (last-resort, single-customer
          only - never guessed when more than one customer is waiting, since a
          wrong guess would leak/misroute someone else's transaction).
+      4. Intergram's tag, as a last-ditch, best-effort check only - kept in
+         case some sessions don't fully reset it. Never relied on for
+         correctness; if it happens to hit, great, but the paths above are
+         what actually make reconciliation work.
 
     Returns (canonical_key, cleaned_text).
     """
     tag, cleaned_text = extract_intergram_tag(raw_text)
 
-    if tag:
-        known_key = intergram_tag_to_key.get(tag)
-        if known_key and known_key != chat_customer_key and (
-            known_key in pending_approvals or known_key in user_memory
-        ):
-            _repoint_customer_routing(message, known_key)
-            save_state()
-            return known_key, cleaned_text
-        # First time we've seen this tag, or it already matches this chat -
-        # remember the mapping for next time.
-        intergram_tag_to_key[tag] = chat_customer_key
-        return chat_customer_key, cleaned_text
-
-    # No tag on this message - fall back to the older heuristics.
     if chat_customer_key in pending_approvals or chat_customer_key in user_memory:
+        if tag:
+            intergram_tag_to_key[tag] = chat_customer_key
         return chat_customer_key, cleaned_text
 
     phone = extract_phone_from_text(cleaned_text)
@@ -1439,6 +1453,18 @@ def reconcile_returning_customer(message, chat_customer_key, raw_text):
         only_key, only_info = next(iter(pending_approvals.items()))
         if only_info.get("alert_sent"):
             old_key = only_key
+
+    if not old_key and tag:
+        known_key = intergram_tag_to_key.get(tag)
+        if known_key and known_key != chat_customer_key and (
+            known_key in pending_approvals or known_key in user_memory
+        ):
+            old_key = known_key
+
+    if tag:
+        # Remember this tag -> key pairing regardless of whether it helped just
+        # now; costs nothing and might help on some future message.
+        intergram_tag_to_key[tag] = chat_customer_key
 
     if not old_key or old_key == chat_customer_key:
         return chat_customer_key, cleaned_text
@@ -1574,14 +1600,41 @@ def extract_registered_bare_ref(text):
                     return fp
     return None
 
-def choose_package(amount, explicit_pkg):
+def _match_candidate_by_data(text, candidates):
+    """When the price alone is ambiguous between 2+ packages, try to settle it using the
+    DATA amount/type the customer mentioned (e.g. '12gb', '5 gb', 'unlimited') - but ONLY
+    within the already price-filtered candidate list, so this can never assign a package
+    the customer didn't actually pay for. Returns a package key only when exactly one
+    candidate's data field is referenced in the text; otherwise None (=> still ask)."""
+    if not text or not candidates:
+        return None
+    t = text.lower()
+    matches = []
+    for pkg in candidates:
+        data = PACKAGES[pkg]["data"].lower()  # e.g. "unlimited", "5gb", "12gb"
+        if data == "unlimited":
+            if re.search(r'\bunlimit', t):
+                matches.append(pkg)
+        else:
+            gb_num = re.sub(r'[^0-9]', '', data)
+            if gb_num and re.search(rf'\b{gb_num}\s*gb\b', t):
+                matches.append(pkg)
+    return matches[0] if len(matches) == 1 else None
+
+def choose_package(amount, explicit_pkg, raw_text=None):
     """Package from the amount paid. Ambiguous amounts use the customer's own choice if it is
-    one of the candidates, otherwise None (=> ask)."""
+    one of the candidates, then try matching the data amount/type they mentioned (e.g. '12gb'),
+    otherwise None (=> ask)."""
     candidates = PRICE_TO_PACKAGES.get(amount or "", [])
     if len(candidates) == 1:
         return candidates[0], candidates
     if len(candidates) > 1:
-        return (explicit_pkg if explicit_pkg in candidates else None), candidates
+        if explicit_pkg in candidates:
+            return explicit_pkg, candidates
+        data_match = _match_candidate_by_data(raw_text, candidates)
+        if data_match:
+            return data_match, candidates
+        return None, candidates
     return (explicit_pkg if explicit_pkg in PACKAGES else None), list(PACKAGES)
 
 def package_question(amount, candidates):
@@ -1590,7 +1643,8 @@ def package_question(amount, candidates):
         head = f"Your payment of ${amount} matches more than one package:"
     else:
         head = "Which package would you like?"
-    return f"{head}\n{opts}\n\nPlease reply with just the package name."
+    return (f"{head}\n{opts}\n\nPlease reply with just the package name "
+            "(or simply the amount of data, e.g. '12GB' or 'unlimited').")
 
 def _send_reply(message, customer_key, out_text, user_text=None):
     out_text = ensure_closing_warning(out_text)
@@ -1743,7 +1797,7 @@ def advance_pending(message, customer_key, text):
         return True
 
     amount = proof["amount"] if proof else info.get("claimed_amount")
-    pkg, candidates = choose_package(amount, info.get("package_key"))
+    pkg, candidates = choose_package(amount, info.get("package_key"), text)
     if not pkg:
         info["package"] = None
         info["package_key"] = None
@@ -1923,7 +1977,18 @@ def handle_customer_message(message):
                 pending_approvals[customer_key]["package_confirmed"] = True
 
     # Payment fast-path: auto-approve on full proof, or alert admin (package chosen by price).
-    if extracted_ref or extracted_pkg or extracted_phone:
+    # Also run this whenever the customer already has an open, not-yet-alerted payment request
+    # waiting on a missing slot (almost always just the package) - even if THIS message didn't
+    # parse into a phone/package/ref on its own. Without this, an unrecognized reply (a stray
+    # "12GB valid fo" cut short, or Intergram auto-forwarding the visitor's display name as its
+    # own message) falls through to the free-form AI, which can go off-script - e.g. asking for
+    # a phone number that isn't actually needed yet, or "confirming" a package it never actually
+    # saved to state, forcing the customer to repeat themselves next turn.
+    awaiting_slot = (
+        customer_key in pending_approvals
+        and not pending_approvals[customer_key].get("alert_sent")
+    )
+    if extracted_ref or extracted_pkg or extracted_phone or awaiting_slot:
         if advance_pending(message, customer_key, text):
             return
 
