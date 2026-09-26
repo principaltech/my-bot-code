@@ -965,6 +965,34 @@ def extract_full_reference_from_text(text):
     return raw if len(raw) >= 7 else None
 
 
+def extract_core_reference(text):
+    """The STABLE trailing segment of an approval code - e.g. 'T2514748' out of
+    'PP260926.0931.T2514748' - which is what auto-approval should actually compare on.
+
+    EcoCash-style approval codes are commonly formatted as PP<date>.<time>.T<digits>.
+    The 'PP<date>.<time>' portion reflects when THAT PARTICULAR SMS notification was
+    generated, and can legitimately differ by a few minutes between the sender's and
+    receiver's copies of the exact same transfer (e.g. 'PP260926.0925.T2514748' vs
+    'PP260926.0931.T2514748') - it is NOT a stable transaction attribute. The trailing
+    '.T<digits>' segment is the part that stays identical between both copies, so that's
+    the segment used for matching (not the whole code).
+
+    Splits on '.' or '-' and takes the last segment. Falls back to the last 7 alphanumeric
+    characters of the whole reference if there's no separator to split on."""
+    if not text:
+        return None
+    m = TRANSACTION_REF_PATTERN.search(text)
+    if not m:
+        return None
+    raw = m.group(1).strip(" -\u2014.")
+    seg = re.split(r'[.\-]', raw)[-1]
+    core = re.sub(r'[^A-Za-z0-9]', '', seg)
+    if len(core) >= 4:
+        return core.upper()
+    whole = re.sub(r'[^A-Za-z0-9]', '', raw)
+    return whole[-7:].upper() if len(whole) >= 7 else None
+
+
 def proof_is_incomplete(pending, text):
     """True when the customer gave a code but NOT the full proof of payment.
     A full proof = the FULL approval code plus either a USD amount or the confirmation text
@@ -1020,7 +1048,8 @@ def parse_proof_blocks(text):
         party_m = re.search(r'\b(from|sent\s+to)\s+([^\n.]+)', block, re.IGNORECASE)
         proofs.append({
             "amount": amount,
-            "full_ref": full_ref,                        # compared in full against the customer's proof
+            "full_ref": full_ref,                        # kept for display/back-compat, not for matching
+            "core_ref": extract_core_reference(block),   # stable "T<digits>"-style segment - compared against the customer's proof
             "ref_ending": normalize_ref(full_ref)[-7:],  # lookup key / what admin messages show
             "sender": party_m.group(2).strip() if party_m else "",
             "direction": "to" if (party_m and party_m.group(1).lower().startswith("sent")) else "from",
@@ -1121,12 +1150,20 @@ def try_auto_approve(customer_key):
     if len(claimed_ref) <= 7 or not claimed_amount:
         return False  # partial proof (e.g. only the last digits) is never auto-approved
 
-    # --- verification: the FULL approval code must equal the stored one ---------
-    # (the last 7 characters are only used above to find the stored record)
-    reg_ref = normalize_ref(proof.get("full_ref"))
-    if reg_ref and claimed_ref != reg_ref:
-        print(f"[AUTO] {customer_key}: approval code mismatch (same last 7, different full code) "
-              "- manual flow.")
+    # --- verification: the CORE transaction-id segment must match ---------------
+    # Compares on the stable "T<digits>"-style trailing segment of the approval code
+    # (e.g. "T2514748" out of "PP260926.0931.T2514748"), NOT the whole code. The
+    # leading "PP<date>.<time>" portion is a per-notification timestamp that can
+    # legitimately differ by a few minutes between the sender's and receiver's SMS for
+    # the exact same transfer, so requiring a byte-for-byte match on the whole string
+    # was rejecting genuine matches (Prince flagged this). The last-7-characters
+    # fingerprint is only used above to find the candidate record in the first place;
+    # this is the extra check on top of that.
+    claimed_core = (info.get("claimed_core") or "").upper()
+    reg_core = (proof.get("core_ref") or "").upper()
+    if reg_core and claimed_core and claimed_core != reg_core:
+        print(f"[AUTO] {customer_key}: core reference mismatch ({claimed_core} vs "
+              f"{reg_core}, same last-7) - manual flow.")
         return False
 
     # --- verification: price ------------------------------------------------
@@ -1949,6 +1986,7 @@ def handle_customer_message(message):
                 # characters, code_ending, are what identifies a payment everywhere else.)
                 "claimed_amount": extract_payment_amount(text),
                 "claimed_ref": extract_full_reference_from_text(text),
+                "claimed_core": extract_core_reference(text),
             }
             if is_repeat_customer:
                 # Tell the model explicitly not to reuse stale slot values from earlier
@@ -1969,6 +2007,8 @@ def handle_customer_message(message):
                 current_pending["claimed_amount"] = extract_payment_amount(text)
             if extract_full_reference_from_text(text):
                 current_pending["claimed_ref"] = extract_full_reference_from_text(text)
+            if extract_core_reference(text):
+                current_pending["claimed_core"] = extract_core_reference(text)
             if extracted_phone:
                 current_pending["phone"] = extracted_phone
                 current_pending["phone_confirmed"] = True
@@ -2201,6 +2241,7 @@ def handle_customer_message(message):
                         # LATER can still be verified against it and auto-approve this customer.
                         pending_approvals[customer_key]["claimed_amount"] = existing.get("claimed_amount")
                         pending_approvals[customer_key]["claimed_ref"] = existing.get("claimed_ref")
+                        pending_approvals[customer_key]["claimed_core"] = existing.get("claimed_core")
                         pkg_key = normalize_package(parsed['package'])
                         reserved_code = reserve_voucher(pkg_key)
                         pending_approvals[customer_key]["package_key"] = pkg_key
