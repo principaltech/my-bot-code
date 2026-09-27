@@ -211,18 +211,11 @@ def display_name_for(message):
 pending_approvals = {}
 used_payment_refs = set()
 
-# Maps Intergram's per-visitor tag (the short label Intergram prefixes onto every
-# forwarded message, e.g. "y6ysyx: Hi" - everything up to the first ":" is the
-# tag, everything after it is the actual customer message) to whichever
-# customer_key last used that tag.
-#
-# CONFIRMED: this tag changes together with chat_id whenever the customer
-# leaves/reopens the widget chat - it behaves like chat_id itself, not like a
-# persistent visitor id. So it can't reliably identify a returning customer
-# across a session reset (a new session means a brand-new, never-seen tag).
-# Kept only as a harmless, best-effort fallback - see reconcile_returning_customer()
-# below, which tries the phone number FIRST because that's the signal that
-# actually survives a reset.
+# Maps Intergram's stable per-visitor tag (the short code Intergram prefixes onto
+# every forwarded message, e.g. "y6ysyx: Hi") to whichever customer_key currently
+# holds that visitor's record. Unlike chat_id, this tag does NOT change when the
+# widget session resets, so it's the right thing to key returning-customer
+# identity on.
 intergram_tag_to_key = {}
 
 admin_awaiting = {}
@@ -255,9 +248,9 @@ You are an automated customer care AI assistant for Splash Internet. You MUST fo
    - $5 = Unlimited 14d = USD $5.00 = UNLIMITED
    - $10 = Unlimited 30d = USD $10.00 = UNLIMITED
 3. PAYMENTS & PROOF OF PAYMENT:
-   - EcoCash number is 0776248396. Customers can also click the price of a package on the login portal and process the payment to Splash there.
+   - EcoCash number is 0776248396.
    - You only need proof of payment. The backend detects the package from the amount and does NOT need a phone number unless the payment takes long.
-   - PHONE NUMBER FORMAT: A valid Zimbabwean mobile number is exactly 10 digits starting with 071, 077, 078, or 079 (e.g. 0776248396), or the same number in +263 format (e.g. +263776248396). This is a SEPARATE rule from the transaction reference length below - do not confuse the two. If the customer's phone number is missing digits, has the wrong prefix, or is otherwise not in this format, ask them to resend it correctly. NEVER treat a 7-digit string as a valid phone number.
+   - PHONE NUMBER FORMAT: A valid Zimbabwean mobile number is exactly 10 digits starting with 071, 077, 078, or 079 (e.g. 0771234567), or the same number in +263 format (e.g. +263771234567). This is a SEPARATE rule from the transaction reference length below - do not confuse the two. If the customer's phone number is missing digits, has the wrong prefix, or is otherwise not in this format, ask them to resend it correctly. NEVER treat a 7-digit string as a valid phone number.
    - DISTINGUISH REPLIES: If the user is just answering a question about which package they want (e.g. saying "7d", "7 days", "lite"), DO NOT treat it as a payment reference. Only evaluate transaction references when a full payment confirmation block is provided.
    - A VALID TRANSACTION REFERENCE MUST BE AT LEAST 7 CHARACTERS LONG. If a user provides a reference that is less than 7 characters as a payment code, reject it.
    - EXTRACTING THE TRANSACTION REFERENCE: Look for the longest alphanumeric string in the message. CODE_ENDING MUST be the EXACT last 7 characters of that full reference. Ignore punctuation like dots or dashes. NEVER accept or use a code shorter than 7 characters.
@@ -286,43 +279,7 @@ You are an automated customer care AI assistant for Splash Internet. You MUST fo
    - Tell them to paste the ENTIRE EcoCash confirmation message (the whole "Transfer Confirmation: ... Approval Code: ... New balance: ..." text), NOT just the last digits of the approval code. The backend reads the full approval code and the amount from it, detects the package from the amount, and compares it with our records.
    - If the customer sends only part of the code, politely ask them to paste the FULL proof of payment.
    - Do NOT ask for a phone number or package up front.
-13. WHERE TO PAY:
-   - If the customer asks for the EcoCash number, where to pay, or how to pay, tell them to process their EcoCash payment to 0776248396, OR alternatively to click the price of the package they want on the login portal and pay to Splash. Then tell them to paste the FULL proof of payment. Use 0776248396 in any phone number examples.
-14. PHONE NUMBER TIMING (DO NOT IMPROVISE THIS):
-   - NEVER ask the customer for their phone number on your own initiative. The backend decides exactly when a phone number is actually needed and will tell you via an explicit SYSTEM NOTE when that's the case. If you don't see such a note, do not bring up the phone number at all, even if you think it would help speed things along.
-   - Likewise, never tell the customer "you'd like package X" or otherwise confirm a package choice based on a vague or partial message (like a stray data amount or a cut-off sentence). If you are not certain which package they mean, ask them to reply with just the package name.
 """
-
-# ==========================================
-# BUSINESS PAYMENT NUMBER + "WHERE DO I PAY?" AUTO-REPLY
-# ==========================================
-BUSINESS_NUMBER = "0776248396"
-BUSINESS_NUMBER_INTL = "+263776248396"
-
-PAYMENT_INFO_MESSAGE = (
-    f"To pay, send your EcoCash payment to {BUSINESS_NUMBER} (Splash Internet).\n\n"
-    "Or, even simpler: on the login portal, click the price of the package you want "
-    "and process the payment to Splash from there.\n\n"
-    "After paying, paste the FULL proof of payment (the entire EcoCash confirmation "
-    "message) here using this format:\n\n"
-    "Paste Full Proof of payment:"
-)
-
-PAY_WHERE_RE = re.compile(
-    r"eco\s*-?\s*cash\s*(number|no\b|num)"
-    r"|(what|which|whats|what's)\s*(is\s*)?(the\s*|your\s*|ur\s*)?(number|no\b)"
-    r"|where\s*(do|can|should|must|to)\s*(i\s*|we\s*)?(pay|send|deposit)"
-    r"|how\s*(do|can|to|should)\s*(i\s*|we\s*)?pay"
-    r"|payment\s*(number|details|info|method)"
-    r"|send\s*(money|payment)\s*to"
-    r"|(number|namba)\s*(to|yekubhadhara|for)\s*(pay|payment)?",
-    re.IGNORECASE
-)
-
-def asks_where_to_pay(text):
-    if not text or PROOF_MARKER_RE.search(text):
-        return False
-    return bool(PAY_WHERE_RE.search(text))
 
 WAIT_MESSAGE = "Thank you, we have received your payment proof. Please wait about 30 seconds while we validate the payment."
 ONE_MESSAGE_FORMAT = "Paste Full Proof of payment:"
@@ -346,8 +303,7 @@ def build_welcome_message():
     return (
         "👋 Welcome to Splash Internet!\n\n"
         "Packages:\n" + "\n".join(lines) + "\n\n"
-        f"Pay via EcoCash to {BUSINESS_NUMBER}, or simply click the price of your package on the "
-        "login portal and pay to Splash. Then paste the ENTIRE EcoCash confirmation message "
+        "Pay via EcoCash to 0776248396, then just paste the ENTIRE EcoCash confirmation message "
         "(from \"Transfer Confirmation\" to the end) here. Your package is detected automatically "
         "from the amount you paid."
     )
@@ -357,11 +313,8 @@ PHONE_PATTERN = re.compile(r'\b(0(?:71|77|78|79)\d{7}|\+?263(?:71|77|78|79)\d{7}
 def extract_phone_from_text(text):
     if not text:
         return None
-    for m in PHONE_PATTERN.finditer(text):
-        if normalize_phone(m.group(1)) == normalize_phone(BUSINESS_NUMBER):
-            continue  # that's OUR EcoCash number, not the customer's
-        return m.group(1)
-    return None
+    m = PHONE_PATTERN.search(text)
+    return m.group(1) if m else None
 
 FAKE_APPROVAL_RE = re.compile(
     r'(?:payment\s+(?:has\s+been|was|is|is\s+now)\s+(?:approved|verified|confirmed|successful))'
@@ -406,8 +359,8 @@ def reply_claims_phone_number(reply_text):
 INVALID_PHONE_MESSAGE = (
     "I want to double-check your phone number before we go further. Please resend your "
     "Zimbabwean mobile number so I can confirm it - it must be exactly 10 digits starting "
-    "with 071, 077, 078, or 079 (e.g. 0776248396), or the same number in +263 format "
-    "(e.g. +263776248396)."
+    "with 071, 077, 078, or 079 (e.g. 0771234567), or the same number in +263 format "
+    "(e.g. +263771234567)."
 )
 
 def normalize_phone(num):
@@ -437,8 +390,6 @@ def reply_contains_mismatched_phone(reply_text, known_phone):
         prefix = reply_text[max(0, m.start() - 15):m.start()].lower()
         if 'e.g' in prefix or 'example' in prefix:
             continue
-        if normalize_phone(m.group(1)) == normalize_phone(BUSINESS_NUMBER):
-            continue  # our own payment number is always allowed
         if normalize_phone(m.group(1)) != known_norm:
             return True
     return False
@@ -965,34 +916,6 @@ def extract_full_reference_from_text(text):
     return raw if len(raw) >= 7 else None
 
 
-def extract_core_reference(text):
-    """The STABLE trailing segment of an approval code - e.g. 'T2514748' out of
-    'PP260926.0931.T2514748' - which is what auto-approval should actually compare on.
-
-    EcoCash-style approval codes are commonly formatted as PP<date>.<time>.T<digits>.
-    The 'PP<date>.<time>' portion reflects when THAT PARTICULAR SMS notification was
-    generated, and can legitimately differ by a few minutes between the sender's and
-    receiver's copies of the exact same transfer (e.g. 'PP260926.0925.T2514748' vs
-    'PP260926.0931.T2514748') - it is NOT a stable transaction attribute. The trailing
-    '.T<digits>' segment is the part that stays identical between both copies, so that's
-    the segment used for matching (not the whole code).
-
-    Splits on '.' or '-' and takes the last segment. Falls back to the last 7 alphanumeric
-    characters of the whole reference if there's no separator to split on."""
-    if not text:
-        return None
-    m = TRANSACTION_REF_PATTERN.search(text)
-    if not m:
-        return None
-    raw = m.group(1).strip(" -\u2014.")
-    seg = re.split(r'[.\-]', raw)[-1]
-    core = re.sub(r'[^A-Za-z0-9]', '', seg)
-    if len(core) >= 4:
-        return core.upper()
-    whole = re.sub(r'[^A-Za-z0-9]', '', raw)
-    return whole[-7:].upper() if len(whole) >= 7 else None
-
-
 def proof_is_incomplete(pending, text):
     """True when the customer gave a code but NOT the full proof of payment.
     A full proof = the FULL approval code plus either a USD amount or the confirmation text
@@ -1048,8 +971,7 @@ def parse_proof_blocks(text):
         party_m = re.search(r'\b(from|sent\s+to)\s+([^\n.]+)', block, re.IGNORECASE)
         proofs.append({
             "amount": amount,
-            "full_ref": full_ref,                        # kept for display/back-compat, not for matching
-            "core_ref": extract_core_reference(block),   # stable "T<digits>"-style segment - compared against the customer's proof
+            "full_ref": full_ref,                        # compared in full against the customer's proof
             "ref_ending": normalize_ref(full_ref)[-7:],  # lookup key / what admin messages show
             "sender": party_m.group(2).strip() if party_m else "",
             "direction": "to" if (party_m and party_m.group(1).lower().startswith("sent")) else "from",
@@ -1070,45 +992,16 @@ def find_probable_match(code_ending):
         return fp, registered_proofs.get(fp)
 
 
-def diagnose_mismatch(pending_info, proof):
-    """Returns a short, specific, human-readable reason a registered proof's fingerprint
-    matched but try_auto_approve() still refused to auto-send - so the admin doesn't have
-    to go dig through server logs to find out why. Checked in the same order
-    try_auto_approve() itself checks them."""
-    pending_info = pending_info or {}
-
-    claimed_ref = normalize_ref(pending_info.get("claimed_ref"))
-    claimed_amount = pending_info.get("claimed_amount")
-    if len(claimed_ref) <= 7 or not claimed_amount:
-        return "customer has not pasted the FULL proof of payment yet (only a partial reference)"
-
-    claimed_core = (pending_info.get("claimed_core") or "").upper()
-    reg_core = (proof.get("core_ref") or "").upper()
-    if reg_core and claimed_core and claimed_core != reg_core:
-        return (f"full reference differs beyond the shared last 7 characters "
-                f"(customer's: ...{claimed_core}, registered: ...{reg_core})")
-
-    reg_amount = proof.get("amount")
-    if claimed_amount != reg_amount:
-        return f"amount differs (customer's proof: ${claimed_amount}, registered: ${reg_amount})"
-
-    return "reference/amount could not be fully verified"
-
-
-def probable_match_note(code_ending, pending_info=None):
+def probable_match_note(code_ending):
     """One-line note to append to an admin alert/reminder if a registered proof
-    shares this code ending's fingerprint. Returns '' if there's no candidate.
-    When pending_info (the customer's pending_approvals record) is supplied, the
-    note names the SPECIFIC reason auto-approval didn't fire instead of a generic
-    "full code or amount didn't line up" - see diagnose_mismatch()."""
+    shares this code ending's fingerprint. Returns '' if there's no candidate."""
     fp, proof = find_probable_match(code_ending)
     if not proof:
         return ""
-    reason = diagnose_mismatch(pending_info, proof)
     return (
         f"\n\n💡 Possible match on file: ${proof['amount']}{_party_text(proof)}, "
         f"ref ending {fp} (registered {int(time.time() - proof['registered_at'])}s ago). "
-        f"This did NOT auto-approve ({reason}) - please compare "
+        "This did NOT auto-approve (full code or amount didn't line up) - please compare "
         "against what the customer sent before replying YES.\n"
         f"🗑️ Not a match? Tap to remove it: /matchreject_{fp}"
     )
@@ -1179,20 +1072,12 @@ def try_auto_approve(customer_key):
     if len(claimed_ref) <= 7 or not claimed_amount:
         return False  # partial proof (e.g. only the last digits) is never auto-approved
 
-    # --- verification: the CORE transaction-id segment must match ---------------
-    # Compares on the stable "T<digits>"-style trailing segment of the approval code
-    # (e.g. "T2514748" out of "PP260926.0931.T2514748"), NOT the whole code. The
-    # leading "PP<date>.<time>" portion is a per-notification timestamp that can
-    # legitimately differ by a few minutes between the sender's and receiver's SMS for
-    # the exact same transfer, so requiring a byte-for-byte match on the whole string
-    # was rejecting genuine matches (Prince flagged this). The last-7-characters
-    # fingerprint is only used above to find the candidate record in the first place;
-    # this is the extra check on top of that.
-    claimed_core = (info.get("claimed_core") or "").upper()
-    reg_core = (proof.get("core_ref") or "").upper()
-    if reg_core and claimed_core and claimed_core != reg_core:
-        print(f"[AUTO] {customer_key}: core reference mismatch ({claimed_core} vs "
-              f"{reg_core}, same last-7) - manual flow.")
+    # --- verification: the FULL approval code must equal the stored one ---------
+    # (the last 7 characters are only used above to find the stored record)
+    reg_ref = normalize_ref(proof.get("full_ref"))
+    if reg_ref and claimed_ref != reg_ref:
+        print(f"[AUTO] {customer_key}: approval code mismatch (same last 7, different full code) "
+              "- manual flow.")
         return False
 
     # --- verification: price ------------------------------------------------
@@ -1402,22 +1287,11 @@ def handle_proof_admin_message(text):
 # stranger even though their earlier payment proof is still sitting, unresolved,
 # in pending_approvals under their OLD key.
 #
-# Intergram prefixes every forwarded message with a short per-visitor tag, e.g.
-# "y6ysyx: Hi" - everything up to the first ":" is the tag/username, everything
-# after it is the actual customer message.
-#
-# Per Prince: this tag is emitted at the very start of every forwarded message,
-# up to the first ":", and it changes together with chat_id whenever the
-# customer leaves and reopens the widget chat - i.e. it tracks the SAME session
-# boundary as chat_id itself. Because of that it is checked FIRST below (it's
-# the most specific signal we have for "this is the same visitor session"), with
-# phone number as the fallback when no tag match is found - phone is what
-# actually survives a genuine session reset, since a brand-new session always
-# produces a brand-new, never-before-seen tag.
-#
-# extract_intergram_tag() below splits every incoming message into (tag,
-# message_without_tag) so downstream regexes (phone/reference/package
-# extraction) always see clean customer text either way.
+# The reliable fix: Intergram prefixes every forwarded message with a short,
+# STABLE per-visitor tag, e.g. "y6ysyx: Hi" - that tag does NOT change when the
+# chat_id does, so it's the correct identity key, not chat_id and not phone
+# number. Phone-number matching (and the single-pending fallback) is kept as a
+# secondary safety net for the rare message that doesn't carry a tag.
 
 REBUMP_COOLDOWN_SECONDS = 15  # just enough to absorb accidental double-sends/webhook retries,
                                # not to make an impatient customer wait for a re-alert
@@ -1430,10 +1304,10 @@ FOLLOWUP_STATUS_RE = re.compile(
     re.IGNORECASE
 )
 
-# ASSUMPTION based on the two examples you gave ("cdgrmv:", "y6ysyx:", "tzb3bi:"): the tag
-# is exactly 6 lowercase letters/digits, followed by ":" and then the message. If your
-# Intergram config uses a different length or includes uppercase, adjust {6} and the
-# character class below to match - check a few real forwarded messages to confirm the format.
+# ASSUMPTION based on the two examples you gave ("cdgrmv:", "y6ysyx:"): the tag
+# is exactly 6 lowercase letters/digits. If your Intergram config uses a
+# different length or includes uppercase, adjust {6} and the character class
+# below to match - check a few real forwarded messages to confirm the format.
 INTERGRAM_TAG_RE = re.compile(r'^([a-z0-9]{6}):\s?(.*)$', re.IGNORECASE | re.DOTALL)
 
 def extract_intergram_tag(raw_text):
@@ -1489,21 +1363,11 @@ def reconcile_returning_customer(message, chat_customer_key, raw_text):
     (phone/reference/package extraction) see clean customer text.
 
     Priority, strongest signal first:
-      1. This exact chat_customer_key already has an open record - nothing to
-         reconcile.
-      2. Intergram's per-visitor tag (e.g. "tzb3bi:") matching a key we've
-         already seen that tag paired with. Checked FIRST per Prince's
-         instruction - the tag is the most specific same-session signal we
-         have. NOTE: it changes together with chat_id on a genuine session
-         reset, so it can only ever match within a session we've already
-         recorded the tag for (e.g. a retried/duplicate webhook delivery, or
-         a message arriving before we'd finished routing an earlier one) -
-         it will NOT bridge an actual reset. Phone (below) is what bridges
-         a real reset.
-      3. A phone number in the message matching an open pending approval -
-         the signal that actually survives a widget/session reset, since a
-         new session always produces a brand-new, never-seen tag.
-      4. Exactly ONE open, already-alerted transaction system-wide and this
+      1. Intergram's stable per-visitor tag - trusted on its own, even with
+         zero other info in the message (fixes "hi" / "resend" / "still
+         waiting" with nothing else in it).
+      2. A phone number in the message matching an open pending approval.
+      3. Exactly ONE open, already-alerted transaction system-wide and this
          message reads like a status follow-up (last-resort, single-customer
          only - never guessed when more than one customer is waiting, since a
          wrong guess would leak/misroute someone else's transaction).
@@ -1512,36 +1376,30 @@ def reconcile_returning_customer(message, chat_customer_key, raw_text):
     """
     tag, cleaned_text = extract_intergram_tag(raw_text)
 
-    if chat_customer_key in pending_approvals or chat_customer_key in user_memory:
-        if tag:
-            intergram_tag_to_key[tag] = chat_customer_key
-        return chat_customer_key, cleaned_text
-
-    old_key = None
-
-    # Priority 1: Intergram tag match.
     if tag:
         known_key = intergram_tag_to_key.get(tag)
         if known_key and known_key != chat_customer_key and (
             known_key in pending_approvals or known_key in user_memory
         ):
-            old_key = known_key
+            _repoint_customer_routing(message, known_key)
+            save_state()
+            return known_key, cleaned_text
+        # First time we've seen this tag, or it already matches this chat -
+        # remember the mapping for next time.
+        intergram_tag_to_key[tag] = chat_customer_key
+        return chat_customer_key, cleaned_text
 
-    # Priority 2: phone number match (survives a genuine session reset, unlike the tag).
-    if not old_key:
-        phone = extract_phone_from_text(cleaned_text)
-        old_key = find_pending_by_phone(phone) if phone else None
+    # No tag on this message - fall back to the older heuristics.
+    if chat_customer_key in pending_approvals or chat_customer_key in user_memory:
+        return chat_customer_key, cleaned_text
 
-    # Priority 3: single open + already-alerted transaction, follow-up wording.
+    phone = extract_phone_from_text(cleaned_text)
+    old_key = find_pending_by_phone(phone) if phone else None
+
     if not old_key and len(pending_approvals) == 1 and FOLLOWUP_STATUS_RE.search(cleaned_text or ""):
         only_key, only_info = next(iter(pending_approvals.items()))
         if only_info.get("alert_sent"):
             old_key = only_key
-
-    if tag:
-        # Remember this tag -> key pairing regardless of whether it helped just
-        # now; costs nothing and might help on some future message.
-        intergram_tag_to_key[tag] = chat_customer_key
 
     if not old_key or old_key == chat_customer_key:
         return chat_customer_key, cleaned_text
@@ -1585,7 +1443,7 @@ def reserve_stock_for_waiting(only_package=None, notify=True):
                     f"(code ending {info.get('code_ending')}, {pk}).\n"
                     f"Stored voucher reserved: {code}\n"
                     "Reply YES to send it to the customer, or NO to hold it and provide a different code."
-                    + probable_match_note(info.get("code_ending"), info)
+                    + probable_match_note(info.get("code_ending"))
                 )
             except Exception as e:
                 print(f"[STOCK] Could not notify admin: {e}")
@@ -1620,7 +1478,7 @@ def maybe_bump_admin_for_pending(customer_key, text, label):
         info["last_alert_time"] = now
         return True   # the helper already sent the "stock is now available" message
 
-    note = probable_match_note(info.get("code_ending"), info)
+    note = probable_match_note(info.get("code_ending"))
 
     if admin_chat_id:
         if info.get("proposed_code"):
@@ -1677,41 +1535,14 @@ def extract_registered_bare_ref(text):
                     return fp
     return None
 
-def _match_candidate_by_data(text, candidates):
-    """When the price alone is ambiguous between 2+ packages, try to settle it using the
-    DATA amount/type the customer mentioned (e.g. '12gb', '5 gb', 'unlimited') - but ONLY
-    within the already price-filtered candidate list, so this can never assign a package
-    the customer didn't actually pay for. Returns a package key only when exactly one
-    candidate's data field is referenced in the text; otherwise None (=> still ask)."""
-    if not text or not candidates:
-        return None
-    t = text.lower()
-    matches = []
-    for pkg in candidates:
-        data = PACKAGES[pkg]["data"].lower()  # e.g. "unlimited", "5gb", "12gb"
-        if data == "unlimited":
-            if re.search(r'\bunlimit', t):
-                matches.append(pkg)
-        else:
-            gb_num = re.sub(r'[^0-9]', '', data)
-            if gb_num and re.search(rf'\b{gb_num}\s*gb\b', t):
-                matches.append(pkg)
-    return matches[0] if len(matches) == 1 else None
-
-def choose_package(amount, explicit_pkg, raw_text=None):
+def choose_package(amount, explicit_pkg):
     """Package from the amount paid. Ambiguous amounts use the customer's own choice if it is
-    one of the candidates, then try matching the data amount/type they mentioned (e.g. '12gb'),
-    otherwise None (=> ask)."""
+    one of the candidates, otherwise None (=> ask)."""
     candidates = PRICE_TO_PACKAGES.get(amount or "", [])
     if len(candidates) == 1:
         return candidates[0], candidates
     if len(candidates) > 1:
-        if explicit_pkg in candidates:
-            return explicit_pkg, candidates
-        data_match = _match_candidate_by_data(raw_text, candidates)
-        if data_match:
-            return data_match, candidates
-        return None, candidates
+        return (explicit_pkg if explicit_pkg in candidates else None), candidates
     return (explicit_pkg if explicit_pkg in PACKAGES else None), list(PACKAGES)
 
 def package_question(amount, candidates):
@@ -1720,8 +1551,7 @@ def package_question(amount, candidates):
         head = f"Your payment of ${amount} matches more than one package:"
     else:
         head = "Which package would you like?"
-    return (f"{head}\n{opts}\n\nPlease reply with just the package name "
-            "(or simply the amount of data, e.g. '12GB' or 'unlimited').")
+    return f"{head}\n{opts}\n\nPlease reply with just the package name."
 
 def _send_reply(message, customer_key, out_text, user_text=None):
     out_text = ensure_closing_warning(out_text)
@@ -1775,7 +1605,7 @@ def reply_pending_status(message, customer_key, text):
     if needs_phone(info, text):
         info["phone_asked"] = time.time()
         reply += ("\n\nTo help us speed this up, please also send your phone number "
-                  "(e.g. 0776248396).")
+                  "(e.g. 0771234567).")
     _send_reply(message, customer_key, reply, text)
     return True
 
@@ -1806,7 +1636,7 @@ def alert_admin_for_pending(message, customer_key, pkg, amount, proof, partial, 
                  "Customer sent ONLY the last digits (not the full proof).\n")
         note = f"\n🗑️ Not a match? /matchreject_{fp}"
     elif proof:
-        basis, note = "", probable_match_note(ending, info)
+        basis, note = "", probable_match_note(ending)
     else:
         basis, note = "⚠️ No registered proof on file for this reference - verify manually.\n", ""
 
@@ -1833,7 +1663,7 @@ def alert_admin_for_pending(message, customer_key, pkg, amount, proof, partial, 
     if not proof and not info.get("phone"):
         info["phone_asked"] = time.time()   # stops the watchdog from asking a second time
         reply += ("\n\nSince we're verifying this payment manually, please also send your "
-                  "phone number (e.g. 0776248396).")
+                  "phone number (e.g. 0771234567).")
     _send_reply(message, customer_key, reply, text)
     return True
 
@@ -1874,7 +1704,7 @@ def advance_pending(message, customer_key, text):
         return True
 
     amount = proof["amount"] if proof else info.get("claimed_amount")
-    pkg, candidates = choose_package(amount, info.get("package_key"), text)
+    pkg, candidates = choose_package(amount, info.get("package_key"))
     if not pkg:
         info["package"] = None
         info["package_key"] = None
@@ -1903,7 +1733,7 @@ def run_phone_watchdog():
                 changed = True
                 msg = ensure_closing_warning(
                     "Sorry for the wait - your payment is still being verified. To help us speed "
-                    "things up, please send your phone number (e.g. 0776248396).")
+                    "things up, please send your phone number (e.g. 0771234567).")
                 try:
                     customer_bot.send_message(chat_id, msg)
                     user_memory.setdefault(key, [{"role": "system", "content": system_rules}]) \
@@ -1968,12 +1798,6 @@ def handle_customer_message(message):
     if customer_key not in user_memory:
         user_memory[customer_key] = [{"role": "system", "content": system_rules}]
 
-    # "Where do I pay / what's the EcoCash number?" -> fixed, deterministic answer (no AI).
-    # Never fires when the message contains a real proof (Approval Code / Transfer Confirmation).
-    if not extracted_ref and asks_where_to_pay(text):
-        _send_reply(message, customer_key, PAYMENT_INFO_MESSAGE, text)
-        return
-
     # If this is just a status follow-up on an already-open, already-alerted
     # transaction (no fresh reference this turn), answer from real state and
     # skip the LLM entirely - guarantees no fabricated status, bumps the admin at
@@ -2015,7 +1839,6 @@ def handle_customer_message(message):
                 # characters, code_ending, are what identifies a payment everywhere else.)
                 "claimed_amount": extract_payment_amount(text),
                 "claimed_ref": extract_full_reference_from_text(text),
-                "claimed_core": extract_core_reference(text),
             }
             if is_repeat_customer:
                 # Tell the model explicitly not to reuse stale slot values from earlier
@@ -2036,8 +1859,6 @@ def handle_customer_message(message):
                 current_pending["claimed_amount"] = extract_payment_amount(text)
             if extract_full_reference_from_text(text):
                 current_pending["claimed_ref"] = extract_full_reference_from_text(text)
-            if extract_core_reference(text):
-                current_pending["claimed_core"] = extract_core_reference(text)
             if extracted_phone:
                 current_pending["phone"] = extracted_phone
                 current_pending["phone_confirmed"] = True
@@ -2057,18 +1878,7 @@ def handle_customer_message(message):
                 pending_approvals[customer_key]["package_confirmed"] = True
 
     # Payment fast-path: auto-approve on full proof, or alert admin (package chosen by price).
-    # Also run this whenever the customer already has an open, not-yet-alerted payment request
-    # waiting on a missing slot (almost always just the package) - even if THIS message didn't
-    # parse into a phone/package/ref on its own. Without this, an unrecognized reply (a stray
-    # "12GB valid fo" cut short, or Intergram auto-forwarding the visitor's display name as its
-    # own message) falls through to the free-form AI, which can go off-script - e.g. asking for
-    # a phone number that isn't actually needed yet, or "confirming" a package it never actually
-    # saved to state, forcing the customer to repeat themselves next turn.
-    awaiting_slot = (
-        customer_key in pending_approvals
-        and not pending_approvals[customer_key].get("alert_sent")
-    )
-    if extracted_ref or extracted_pkg or extracted_phone or awaiting_slot:
+    if extracted_ref or extracted_pkg or extracted_phone:
         if advance_pending(message, customer_key, text):
             return
 
@@ -2270,7 +2080,6 @@ def handle_customer_message(message):
                         # LATER can still be verified against it and auto-approve this customer.
                         pending_approvals[customer_key]["claimed_amount"] = existing.get("claimed_amount")
                         pending_approvals[customer_key]["claimed_ref"] = existing.get("claimed_ref")
-                        pending_approvals[customer_key]["claimed_core"] = existing.get("claimed_core")
                         pkg_key = normalize_package(parsed['package'])
                         reserved_code = reserve_voucher(pkg_key)
                         pending_approvals[customer_key]["package_key"] = pkg_key
@@ -2290,7 +2099,7 @@ def handle_customer_message(message):
                                 f"Package: {parsed['package']}\n\n"
                                 f"Stored voucher found: {reserved_code}\n"
                                 f"Reply YES to send it to the customer, or NO to hold it and provide a different code."
-                                + probable_match_note(parsed['code_ending'], pending_approvals.get(customer_key))
+                                + probable_match_note(parsed['code_ending'])
                             )
                         else:
                             admin_msg = (
@@ -2301,7 +2110,7 @@ def handle_customer_message(message):
                                 f"Phone: {parsed['phone']}\n"
                                 f"Package: {parsed['package']}\n\n"
                                 f"No stored code for this package. Reply with a new voucher code to approve, or 'no' to reject."
-                                + probable_match_note(parsed['code_ending'], pending_approvals.get(customer_key))
+                                + probable_match_note(parsed['code_ending'])
                             )
                     else:
                         if customer_key in pending_approvals and pending_approvals[customer_key].get("alert_sent"):
@@ -2314,7 +2123,7 @@ def handle_customer_message(message):
                             "last_alert_time": time.time(),
                         }
                         admin_msg = (f"🔔 ADMIN ALERT (Customer: {label}):\n{alert_text}"
-                                      + probable_match_note(fallback_ending, pending_approvals.get(customer_key)))
+                                      + probable_match_note(fallback_ending))
                     admin_bot.send_message(admin_chat_id, admin_msg)
             else:
                 clean_reply += "\n\n⚠️ SYSTEM NOTIFICATION: The Admin Bot is currently unlinked. (Admin: Please send /start to the Admin bot to reconnect routing)."
@@ -2830,7 +2639,7 @@ def run_admin_bot():
 
 if __name__ == "__main__":
     import sys
-    print("[VERSION] splash_bot.py — smart payment fast-path (price-based package, no up-front phone) + auto stock reservation + YES-on-unreserved fix + Intergram reconnect (tag-first, phone-fallback) + pre-registered proof auto-approval + where-to-pay auto-reply + specific mismatch reasons in admin notes", flush=True)
+    print("[VERSION] splash_bot.py — smart payment fast-path (price-based package, no up-front phone) + auto stock reservation + YES-on-unreserved fix + Intergram reconnect + pre-registered proof auto-approval", flush=True)
     load_state()
     print(f"[Groq] Loaded {len(groq_clients)} API key(s) for rotation/fallback.", flush=True)
     print(f"[AUTO] Auto-approval {'ENABLED' if AUTO_APPROVE_ENABLED else 'DISABLED'} "
