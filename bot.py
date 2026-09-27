@@ -293,6 +293,9 @@ You are an automated customer care AI assistant for Splash Internet. You MUST fo
    - Likewise, never tell the customer "you'd like package X" or otherwise confirm a package choice based on a vague or partial message (like a stray data amount or a cut-off sentence). If you are not certain which package they mean, ask them to reply with just the package name.
 15. AUTO-APPROVED CUSTOMERS - NEVER ASK FOR EXTRA INFO:
    - The backend can silently auto-approve and deliver a voucher the instant a customer's full proof of payment matches a proof already on file, with zero phone number or package questions asked. If a SYSTEM NOTE tells you a voucher was already delivered, do not ask about phone numbers or packages for that closed transaction under any circumstance.
+16. LOGGING OUT:
+   - If a customer asks how to log out, wants to end their session, or wants to disconnect their device from the portal, tell them to type exactly: logout xxxxxx (replacing xxxxxx with their own code), right here in this chat. Logging out is handled automatically by the system the moment they type that - you do not process it yourself.
+   - NEVER claim someone has been logged out, is not logged in, or that cookies were cleared. You have no way of knowing that. That status is reported directly to the customer by the system, not by you.
 """
 
 # ==========================================
@@ -930,6 +933,31 @@ SERVICE_MESSAGE_PATTERNS = re.compile(
 
 def is_service_message(text):
     return bool(SERVICE_MESSAGE_PATTERNS.search(text or ""))
+
+# ==========================================
+# LOGOUT MESSAGES: never send an AI/deterministic reply to these.
+#
+# Covers, case-insensitively:
+#   - the bare word "logout" / "Logout"
+#   - "logout <anycode>" (e.g. "logout hwidzo5") - the customer's own logout command
+#   - "Notice: User 'hwidzo5' is not currently logged in." - a system status line that
+#     gets forwarded into the chat (any username in place of hwidzo5)
+#   - "Successfully logged out and cleared cookies for user: hwidzo5" - ditto
+#
+# These are status lines / commands produced by an external logout mechanism, not
+# something this bot should ever comment on, confirm, or respond to - so the handler
+# just returns immediately with zero reply (no AI call, no deterministic message,
+# no state changes) whenever any of them appear anywhere in the message.
+# ==========================================
+LOGOUT_SUPPRESS_RE = re.compile(
+    r'^\s*logout\b'                                                       # "logout" / "Logout" / "logout xxxxxx"
+    r'|notice:\s*user\s*[\'"]?[\w.\-]+[\'"]?\s*is\s*not\s*currently\s*logged\s*in\.?'
+    r'|successfully\s*logged\s*out\s*and\s*cleared\s*cookies\s*for\s*user\s*:?\s*[\w.\-]+',
+    re.IGNORECASE
+)
+
+def is_logout_message(text):
+    return bool(text) and bool(LOGOUT_SUPPRESS_RE.search(text.strip()))
 
 def cancel_pending_for_customer(customer_key, reason="left the chat"):
     info = pending_approvals.pop(customer_key, None)
@@ -2088,6 +2116,13 @@ def handle_customer_message(message):
         cancel_pending_for_customer(make_customer_key(message))
         return
 
+    # Logout-related messages/system notices: NEVER reply to these, in any way -
+    # no AI call, no deterministic message, no state changes. Checked on the raw
+    # text before any other processing so nothing downstream can override it.
+    if is_logout_message(message.text):
+        print(f"[LOGOUT] Suppressing all reply - logout-related message detected: {message.text[:120]!r}")
+        return
+
     customer_key = make_customer_key(message)
     raw_text = message.text.strip()
 
@@ -2096,6 +2131,13 @@ def handle_customer_message(message):
     # with phone-number matching as a fallback. Also strips the tag off the
     # text so extraction regexes below see clean customer text.
     customer_key, text = reconcile_returning_customer(message, customer_key, raw_text)
+
+    # Re-check for a logout message AFTER the Intergram tag is stripped, in case the
+    # tag prefix (e.g. "y6ysyx: logout hwidzo5") would otherwise hide it from the
+    # check above.
+    if is_logout_message(text):
+        print(f"[LOGOUT] Suppressing all reply (post-tag-strip) for {customer_key}: {text[:120]!r}")
+        return
 
     user_last_message_id[customer_key] = message.message_id
     customer_chat_id[customer_key] = message.chat.id
@@ -2988,7 +3030,7 @@ def run_admin_bot():
 
 if __name__ == "__main__":
     import sys
-    print("[VERSION] splash_bot.py — merged auto-approval (core-ref matching, no phone/package interrogation on auto-approve) + smart payment fast-path + auto stock reservation + YES-on-unreserved fix + Intergram reconnect (tag-first, phone-fallback) + pre-registered proof auto-approval + where-to-pay auto-reply + specific mismatch reasons in admin notes", flush=True)
+    print("[VERSION] splash_bot.py — merged auto-approval (core-ref matching, no phone/package interrogation on auto-approve) + smart payment fast-path + auto stock reservation + YES-on-unreserved fix + Intergram reconnect (tag-first, phone-fallback) + pre-registered proof auto-approval + where-to-pay auto-reply + specific mismatch reasons in admin notes + logout-message suppression", flush=True)
     load_state()
     print(f"[Groq] Loaded {len(groq_clients)} API key(s) for rotation/fallback.", flush=True)
     print(f"[AUTO] Auto-approval {'ENABLED' if AUTO_APPROVE_ENABLED else 'DISABLED'} "
