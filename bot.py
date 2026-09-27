@@ -611,9 +611,14 @@ def normalize_package(text):
     if not text:
         return None
     t = re.sub(r'\s+', ' ', text.strip()).upper()
-    if t in PACKAGES:
-        return t
-    candidates = [k for k in PACKAGES if t in k or k in t]
+    # BUGFIX: compare uppercased-vs-uppercased on both sides. PACKAGES keys like
+    # "$5 = Unlimited 14d" are mixed-case, so comparing them directly against an
+    # upper-cased customer string ("UNLIMITED", "$5 = UNLIMITED 14D") never matched -
+    # only the already-all-caps keys ("$1:UNL:24HRS", "2 DAYS", "7 DAYS") ever could.
+    for k in PACKAGES:
+        if t == k.upper():
+            return k
+    candidates = [k for k in PACKAGES if t in k.upper() or k.upper() in t]
     return candidates[0] if len(candidates) == 1 else None
 
 PACKAGE_ALIASES = {re.sub(r'\s+', '', k.upper()): k for k in PACKAGES}
@@ -1101,6 +1106,21 @@ def diagnose_mismatch(pending_info, proof):
     reg_amount = proof.get("amount")
     if claimed_amount != reg_amount:
         return f"amount differs (customer's proof: ${claimed_amount}, registered: ${reg_amount})"
+
+    pkg_key = pending_info.get("package_key")
+    if pkg_key and pkg_key in PACKAGES:
+        try:
+            requested_price = f"{float(PACKAGES[pkg_key]['price'].replace('$', '')):.2f}"
+        except ValueError:
+            requested_price = None
+        if requested_price and requested_price != reg_amount:
+            return (f"customer's selected package ({pkg_key}) costs ${requested_price}, "
+                    f"which doesn't match the registered payment of ${reg_amount}")
+    else:
+        matches = PRICE_TO_PACKAGES.get(reg_amount or "", [])
+        if len(matches) != 1:
+            return (f"${reg_amount} matches {len(matches)} package(s) and none is confirmed yet "
+                     "for this customer")
 
     return "reference/amount could not be fully verified"
 
@@ -1931,6 +1951,61 @@ def run_phone_watchdog():
             print(f"[WATCHDOG] Error: {e}")
 
 
+def set_customer_package(customer_key, new_pkg):
+    """Safely applies a package choice to an open pending transaction.
+
+    BUGFIX: previously, any place a package keyword was recognized in a customer's
+    message (e.g. "7d", "7 days") blindly overwrote pending_approvals[...]["package_key"]
+    - even when an admin approval alert had ALREADY been sent (alert_sent=True) with a
+    SPECIFIC stock voucher reserved for a DIFFERENT package. That silent swap meant:
+      - the reserved voucher stayed checked out of the OLD package's stock forever, and
+      - on the customer's very next message, reply_pending_status() calls
+        try_auto_approve() first, which resolves package/price ambiguity using whatever
+        package_key happens to be set - so a coincidentally-matching registered proof
+        (e.g. two customers' refs sharing the same last-7-character fingerprint) could
+        pass the price-match check under the NEW package and get auto-delivered with
+        NO admin YES/NO click at all, even though the original ambiguous submission was
+        correctly routed to manual review.
+
+    Fix: if the package actually changes AFTER an alert was already sent, treat it as a
+    genuine correction - return any reserved voucher to the old package's stock, drop
+    alert_sent back to False (so the normal advance_pending()/choose_package() flow
+    re-validates price + re-alerts the admin for the NEW package), and tell the admin
+    what happened so nothing is silently swapped out from under them.
+    """
+    info = pending_approvals.get(customer_key)
+    if not info or not new_pkg:
+        return
+    old_pkg = info.get("package_key")
+    if old_pkg == new_pkg:
+        info["package"] = new_pkg
+        info["package_confirmed"] = True
+        return
+
+    if info.get("alert_sent"):
+        if info.get("proposed_code"):
+            return_voucher(old_pkg, info["proposed_code"])
+            info["proposed_code"] = None
+        info["alert_sent"] = False
+        label = customer_display.get(customer_key, customer_key)
+        if admin_chat_id:
+            try:
+                admin_bot.send_message(
+                    admin_chat_id,
+                    f"ℹ️ {label} changed their package selection "
+                    f"(code ending {info.get('code_ending')}) from "
+                    f"{old_pkg or '(unconfirmed)'} to {new_pkg}. Any voucher reserved for the "
+                    "old package was returned to stock - a fresh approval request for the "
+                    "new package follows automatically."
+                )
+            except Exception as e:
+                print(f"[PACKAGE-SWITCH] Could not notify admin: {e}")
+
+    info["package"] = new_pkg
+    info["package_key"] = new_pkg
+    info["package_confirmed"] = True
+
+
 # ==========================================
 # CUSTOMER BOT HANDLER
 # ==========================================
@@ -2057,9 +2132,7 @@ def handle_customer_message(message):
                 current_pending["phone"] = extracted_phone
                 current_pending["phone_confirmed"] = True
             if extracted_pkg:
-                current_pending["package"] = extracted_pkg
-                current_pending["package_key"] = extracted_pkg
-                current_pending["package_confirmed"] = True
+                set_customer_package(customer_key, extracted_pkg)
     else:
         # Update existing slot state with phone or package if sent separately
         if customer_key in pending_approvals:
@@ -2067,9 +2140,7 @@ def handle_customer_message(message):
                 pending_approvals[customer_key]["phone"] = extracted_phone
                 pending_approvals[customer_key]["phone_confirmed"] = True
             if extracted_pkg:
-                pending_approvals[customer_key]["package"] = extracted_pkg
-                pending_approvals[customer_key]["package_key"] = extracted_pkg
-                pending_approvals[customer_key]["package_confirmed"] = True
+                set_customer_package(customer_key, extracted_pkg)
 
     # Payment fast-path: try_auto_approve fires FIRST inside advance_pending, so a matching
     # registered proof is delivered instantly here with no phone/package interrogation.
