@@ -607,6 +607,38 @@ def find_target_customer(admin_text):
 
     return None
 
+def extract_package_for_pending(customer_key, text):
+    """Package extraction that ALSO considers the customer's currently open pending
+    transaction, so a data-type answer ("Unlimited", "12GB") to the disambiguation
+    question resolves at the exact same top-level stage as a duration answer ("7d",
+    "7 days") - both then flow through the identical set_customer_package() safety
+    guard, instead of "Unlimited" only ever being resolved much later and differently,
+    deep inside choose_package()/advance_pending(). Fully case-insensitive either way.
+    """
+    pkg = extract_customer_package(text)
+    if pkg:
+        return pkg
+
+    info = pending_approvals.get(customer_key)
+    if not info:
+        return None
+
+    # Figure out the amount actually in play for this transaction, so "Unlimited" is
+    # only ever matched against the packages that amount could plausibly mean - never
+    # guessed blindly across the whole catalog.
+    amount = info.get("claimed_amount")
+    if not amount:
+        fp = proof_fingerprint(info.get("code_ending"))
+        if fp:
+            with _proofs_lock:
+                proof = registered_proofs.get(fp)
+            if proof:
+                amount = proof.get("amount")
+
+    candidates = PRICE_TO_PACKAGES.get(amount, []) if amount else list(PACKAGES)
+    return _match_candidate_by_data(text, candidates)
+
+
 def normalize_package(text):
     if not text:
         return None
@@ -1083,6 +1115,32 @@ def find_probable_match(code_ending):
         return None, None
     with _proofs_lock:
         return fp, registered_proofs.get(fp)
+
+
+def proof_actually_matches(pending_info, proof):
+    """True only if a registered proof GENUINELY corresponds to what this customer
+    themselves claimed - same stable core reference AND same amount (the same checks
+    try_auto_approve() relies on, short of package/stock availability).
+
+    A "possible match" that only shares the same last-7-character fingerprint by
+    coincidence (see diagnose_mismatch/probable_match_note) does NOT count as a match
+    here. Callers must treat that case exactly as if no registered proof existed at
+    all - including still asking the customer for their phone number, since nothing
+    has actually been verified against their payment."""
+    if not proof:
+        return False
+    pending_info = pending_info or {}
+    claimed_ref = normalize_ref(pending_info.get("claimed_ref"))
+    claimed_amount = pending_info.get("claimed_amount")
+    if len(claimed_ref) <= 7 or not claimed_amount:
+        return False
+    claimed_core = (pending_info.get("claimed_core") or "").upper()
+    reg_core = (proof.get("core_ref") or "").upper()
+    if reg_core and claimed_core and claimed_core != reg_core:
+        return False
+    if claimed_amount != proof.get("amount"):
+        return False
+    return True
 
 
 def diagnose_mismatch(pending_info, proof):
@@ -1834,12 +1892,23 @@ def alert_admin_for_pending(message, customer_key, pkg, amount, proof, partial, 
 
     ending = info["code_ending"]
     fp = proof_fingerprint(ending)
-    if proof and partial:
+    genuine_match = proof_actually_matches(info, proof)
+    if genuine_match and partial:
         basis = (f"✅ Matches registered proof: ${proof['amount']}{_party_text(proof)}, ref ending {fp}.\n"
                  "Customer sent ONLY the last digits (not the full proof).\n")
         note = f"\n🗑️ Not a match? /matchreject_{fp}"
-    elif proof:
+    elif genuine_match:
         basis, note = "", probable_match_note(ending, info)
+    elif proof:
+        # A registered proof exists under this same last-7-character fingerprint, but it
+        # does NOT genuinely verify against what this customer actually claimed (wrong
+        # core reference and/or wrong amount) - most likely a different transaction that
+        # coincidentally collided on the same last 7 characters. Treat this exactly like
+        # "no registered proof" below (including still asking for the phone number),
+        # rather than silently trusting an unverified coincidence.
+        basis = ("⚠️ A registered proof shares this reference's last 7 characters, but the "
+                 "full details don't match this customer's payment - verify manually.\n")
+        note = probable_match_note(ending, info)
     else:
         basis, note = "⚠️ No registered proof on file for this reference - verify manually.\n", ""
 
@@ -1861,9 +1930,11 @@ def alert_admin_for_pending(message, customer_key, pkg, amount, proof, partial, 
         print(f"[ALERT] Could not notify admin: {e}")
 
     reply = WAIT_MESSAGE
-    # No saved proof to verify against -> ask for the phone number right away
-    # (unless they already included a valid one in their message).
-    if not proof and not info.get("phone"):
+    # Ask for the phone number whenever this transaction hasn't been genuinely verified
+    # against a registered proof yet - that includes both "no proof on file at all" and
+    # "a proof exists but doesn't actually match" (a fingerprint collision). Skip it only
+    # when they already gave a valid one, or when the match is genuine.
+    if not genuine_match and not info.get("phone"):
         info["phone_asked"] = time.time()   # stops the watchdog from asking a second time
         reply += ("\n\nSince we're verifying this payment manually, please also send your "
                   "phone number (e.g. 0776248396).")
@@ -2035,7 +2106,7 @@ def handle_customer_message(message):
     if not extracted_ref:
         extracted_ref = extract_registered_bare_ref(text)   # last 7 digits matching a saved proof
     extracted_phone = extract_phone_from_message(text)
-    extracted_pkg = extract_package_from_message(text)
+    extracted_pkg = extract_package_from_message(text) or extract_package_for_pending(customer_key, text)
 
     # Advisory-only: a bare digit-only message (no label at all, so it is NOT a confirmed
     # reference) may still be worth flagging to the admin if it happens to match something
