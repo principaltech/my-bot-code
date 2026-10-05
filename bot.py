@@ -883,6 +883,7 @@ def perform_full_memory_reset():
     customer_chat_id.clear()
     customer_display.clear()
     customer_last_code.clear()
+    customer_last_phone.clear()
     used_payment_refs.clear()
     intergram_tag_to_key.clear()
     with _proofs_lock:
@@ -978,6 +979,45 @@ def cancel_pending_for_customer(customer_key, reason="left the chat"):
     return True
 
 
+# ==========================================
+# VISITOR LEFT: "<visitor id> has left"  ->  halt pending approvals + forget the customer
+#
+# Intergram posts "<random id> has left" when a visitor closes the widget. The id is random
+# alphanumeric, 6-9 characters (e.g. "8v77w2 has left"). When that happens we:
+#   1. cancel any pending approval (reserved voucher goes back to stock, admin is told),
+#   2. wipe everything remembered about that visitor so a return starts completely fresh.
+# used_payment_refs and admin-registered proofs are deliberately NOT touched - they belong to
+# the payment, not the visitor, so replay protection keeps working.
+# ==========================================
+VISITOR_LEFT_RE = re.compile(r'^\s*(?P<tag>[A-Za-z0-9]{6,9})\s*:?\s+has\s+left\b', re.IGNORECASE)
+
+def forget_customer(customer_key, reason="left the chat"):
+    """Cancels any pending approval (returns the reserved voucher to stock, notifies admin)
+    and wipes everything remembered about this customer so the next chat starts fresh."""
+    cancel_pending_for_customer(customer_key, reason)   # must run before the display name is dropped
+    user_memory.pop(customer_key, None)
+    user_last_message_id.pop(customer_key, None)
+    customer_chat_id.pop(customer_key, None)
+    customer_display.pop(customer_key, None)
+    customer_last_code.pop(customer_key, None)
+    customer_last_phone.pop(customer_key, None)
+    _bare_digit_last_notify.pop(customer_key, None)
+    for t in [t for t, k in intergram_tag_to_key.items() if k == customer_key]:
+        intergram_tag_to_key.pop(t, None)
+
+def handle_visitor_left(message, tag):
+    keys = {k for t, k in intergram_tag_to_key.items() if t.lower() == tag.lower()}
+    # Intergram gives each visitor their own private chat, so chat_id also identifies them.
+    # Never do this in a group - it would wipe everyone in it.
+    if getattr(message.chat, "type", "") == "private":
+        keys |= {k for k, cid in customer_chat_id.items() if cid == message.chat.id}
+        keys.add(make_customer_key(message))
+    for k in keys:
+        forget_customer(k, reason=f"left the chat ({tag})")
+    print(f"[LEFT] {tag}: forgot {len(keys)} customer record(s).")
+    save_state()
+
+
 # ==========================================================================
 # PRE-REGISTERED PROOF OF PAYMENT  ->  AUTO-APPROVAL
 #
@@ -989,16 +1029,18 @@ def cancel_pending_for_customer(customer_key, reason="left the chat"):
 #      The bot stores the amount (1.00) and the FULL approval code
 #      (PP260919.2324.T3345746). Its last 7 characters (3345746) are the lookup key
 #      shown in messages. The sender name is just a label.
-#   2. The customer must paste the FULL proof of payment. The bot auto-approves ONLY if
-#         - the last 7 chars of their approval code find a registered proof, AND
-#         - the STABLE trailing segment of their approval code (e.g. "T3345746") equals
-#           the registered one - the customer never has to match the whole code, since
-#           the leading "PP<date>.<time>" portion of EcoCash's approval codes can
-#           legitimately differ by a few minutes between the sender's and receiver's
-#           copy of the exact same transfer, AND
-#         - the amount in their proof equals the registered amount, AND
-#         - the chosen package costs exactly that amount, AND
-#         - a stocked voucher exists for that package.
+#   2. The bot auto-approves when the last 7 chars of the customer's reference find a
+#      registered proof AND:
+#         - FULL proof pasted: the STABLE trailing segment of their approval code
+#           (e.g. "T3345746") equals the registered one - the leading
+#           "PP<date>.<time>" portion can legitimately differ by a few minutes between
+#           the sender's and receiver's copy of the same transfer - AND the amount in
+#           their proof equals the registered amount.
+#         - PARTIAL reference (>=7 chars, e.g. just "3345746"): the last-7 match alone is
+#           enough (AUTO_APPROVE_PARTIAL, on by default); the REGISTERED proof's amount
+#           decides the package.
+#         - in both cases the paid amount maps to exactly one package (or the customer
+#           has picked one that costs exactly that amount), AND a stocked voucher exists.
 #      Anything else falls through to the normal AI + admin YES/NO flow.
 #   3. Auto-approval NEVER asks the customer for a phone number or a package - the
 #      package is inferred automatically from the amount paid, and AUTO_APPROVE_REQUIRE_PHONE
@@ -1012,6 +1054,9 @@ AUTO_APPROVE_ENABLED = os.environ.get("AUTO_APPROVE_ENABLED", "1") != "0"
 # voucher immediately with NO phone number question. Only set AUTO_APPROVE_REQUIRE_PHONE=1
 # if you deliberately want to require the phone number before auto-sending too.
 AUTO_APPROVE_REQUIRE_PHONE = os.environ.get("AUTO_APPROVE_REQUIRE_PHONE", "0") == "1"
+# A partial reference (>=7 chars, e.g. "3345746" or "T3345746") whose last 7 characters match a
+# registered proof is auto-approved. Set AUTO_APPROVE_PARTIAL=0 to go back to requiring the full proof.
+AUTO_APPROVE_PARTIAL = os.environ.get("AUTO_APPROVE_PARTIAL", "1") != "0"
 
 # fingerprint (last 7 alphanumerics, lowercase) -> {"amount", "full_ref", "core_ref", "ref_ending", "sender", "registered_at"}
 registered_proofs = {}
@@ -1180,17 +1225,17 @@ def diagnose_mismatch(pending_info, proof):
 
     claimed_ref = normalize_ref(pending_info.get("claimed_ref"))
     claimed_amount = pending_info.get("claimed_amount")
-    if len(claimed_ref) <= 7 or not claimed_amount:
+    if (len(claimed_ref) <= 7 or not claimed_amount) and not AUTO_APPROVE_PARTIAL:
         return "customer has not pasted the FULL proof of payment yet (only a partial reference)"
 
     claimed_core = (pending_info.get("claimed_core") or "").upper()
     reg_core = (proof.get("core_ref") or "").upper()
-    if reg_core and claimed_core and claimed_core != reg_core:
+    if claimed_amount and claimed_core and reg_core and claimed_core != reg_core:
         return (f"full reference differs beyond the shared last 7 characters "
                 f"(customer's: ...{claimed_core}, registered: ...{reg_core})")
 
     reg_amount = proof.get("amount")
-    if claimed_amount != reg_amount:
+    if claimed_amount and claimed_amount != reg_amount:
         return f"amount differs (customer's proof: ${claimed_amount}, registered: ${reg_amount})"
 
     pkg_key = pending_info.get("package_key")
@@ -1278,7 +1323,11 @@ def try_auto_approve(customer_key):
 
     IMPORTANT: this never asks the customer for a phone number or a package. Package is
     inferred automatically from the amount paid (see PRICE_TO_PACKAGES below), and phone
-    is only required if you explicitly set AUTO_APPROVE_REQUIRE_PHONE=1 (off by default)."""
+    is only required if you explicitly set AUTO_APPROVE_REQUIRE_PHONE=1 (off by default).
+
+    A PARTIAL reference (>=7 chars whose last 7 match a registered proof, but without the full
+    proof/amount) is also auto-approved while AUTO_APPROVE_PARTIAL is on - the registered
+    proof's amount then decides the package."""
     if not AUTO_APPROVE_ENABLED:
         return False
     info = pending_approvals.get(customer_key)
@@ -1293,33 +1342,33 @@ def try_auto_approve(customer_key):
     if not proof:
         return False  # admin never registered this payment -> manual flow
 
-    # --- verification: the customer must have pasted the FULL proof of payment ---
+    # --- verification ---
     claimed_ref = normalize_ref(info.get("claimed_ref"))
     claimed_amount = info.get("claimed_amount")
-    if len(claimed_ref) <= 7 or not claimed_amount:
-        return False  # partial proof (e.g. only the last digits) is never auto-approved
+    partial = len(claimed_ref) <= 7 or not claimed_amount
 
-    # --- verification: the CORE transaction-id segment must match ---------------
-    # Compares on the stable "T<digits>"-style trailing segment of the approval code
-    # (e.g. "T2514748" out of "PP260926.0931.T2514748"), NOT the whole code. The
-    # leading "PP<date>.<time>" portion is a per-notification timestamp that can
-    # legitimately differ by a few minutes between the sender's and receiver's SMS for
-    # the exact same transfer, so requiring a byte-for-byte match on the whole string
-    # was rejecting genuine matches. The last-7-characters fingerprint is only used
-    # above to find the candidate record in the first place; this is the extra check
-    # on top of that.
-    claimed_core = (info.get("claimed_core") or "").upper()
-    reg_core = (proof.get("core_ref") or "").upper()
-    if reg_core and claimed_core and claimed_core != reg_core:
-        print(f"[AUTO] {customer_key}: core reference mismatch ({claimed_core} vs "
-              f"{reg_core}, same last-7) - manual flow.")
-        return False
-
-    # --- verification: price ------------------------------------------------
-    if claimed_amount != proof["amount"]:
-        print(f"[AUTO] {customer_key}: amount mismatch (claimed {claimed_amount} vs "
-              f"registered {proof['amount']}) - manual flow.")
-        return False
+    if partial:
+        # The last-7-characters fingerprint already matched a registered proof above. A partial
+        # reference can't be checked against the core reference / amount, so the REGISTERED
+        # proof's amount decides the package below.
+        if not AUTO_APPROVE_PARTIAL:
+            return False
+    else:
+        # Compares on the stable "T<digits>"-style trailing segment of the approval code
+        # (e.g. "T2514748" out of "PP260926.0931.T2514748"), NOT the whole code. The
+        # leading "PP<date>.<time>" portion is a per-notification timestamp that can
+        # legitimately differ by a few minutes between the sender's and receiver's SMS for
+        # the exact same transfer.
+        claimed_core = (info.get("claimed_core") or "").upper()
+        reg_core = (proof.get("core_ref") or "").upper()
+        if reg_core and claimed_core and claimed_core != reg_core:
+            print(f"[AUTO] {customer_key}: core reference mismatch ({claimed_core} vs "
+                  f"{reg_core}, same last-7) - manual flow.")
+            return False
+        if claimed_amount != proof["amount"]:
+            print(f"[AUTO] {customer_key}: amount mismatch (claimed {claimed_amount} vs "
+                  f"registered {proof['amount']}) - manual flow.")
+            return False
 
     if AUTO_APPROVE_REQUIRE_PHONE and not info.get("phone"):
         return False
@@ -1420,7 +1469,7 @@ def try_auto_approve(customer_key):
         try:
             admin_bot.send_message(
                 admin_chat_id,
-                f"🤖 AUTO-APPROVED\n"
+                f"🤖 AUTO-APPROVED{' (PARTIAL REFERENCE)' if partial else ''}\n"
                 f"Customer: {label}\n"
                 f"Ref ending: {fp}  |  Paid: ${proof['amount']}"
                 + (f" ({_party_text(proof).strip()})" if proof.get("sender") else "") + "\n"
@@ -1551,11 +1600,15 @@ FOLLOWUP_STATUS_RE = re.compile(
     re.IGNORECASE
 )
 
-# ASSUMPTION: the tag is exactly 6 lowercase letters/digits, followed by ":" and then the
-# message. If your Intergram config uses a different length or includes uppercase, adjust
-# {6} and the character class below to match - check a few real forwarded messages to
-# confirm the format.
-INTERGRAM_TAG_RE = re.compile(r'^([a-z0-9]{6}):\s?(.*)$', re.IGNORECASE | re.DOTALL)
+# The tag is 6-9 lowercase letters/digits (Intergram visitor ids vary in length), followed
+# by ":" and then the message. If your Intergram config uses a different format, adjust the
+# {6,9} and the character class below - check a few real forwarded messages to confirm.
+INTERGRAM_TAG_RE = re.compile(r'^([a-z0-9]{6,9}):\s?(.*)$', re.IGNORECASE | re.DOTALL)
+
+# Field labels that are 6-9 letters followed by ":" (e.g. "Package: 7d", "Mobile: 0771...")
+# and would otherwise be mistaken for a visitor tag.
+_NOT_A_TAG = {"package", "mobile", "balance", "approval", "payment", "amount",
+              "bundle", "whatsapp", "transfer", "reference"}
 
 def extract_intergram_tag(raw_text):
     """
@@ -1567,7 +1620,7 @@ def extract_intergram_tag(raw_text):
     if not raw_text:
         return None, raw_text
     m = INTERGRAM_TAG_RE.match(raw_text.strip())
-    if not m:
+    if not m or m.group(1).lower() in _NOT_A_TAG:
         return None, raw_text
     return m.group(1), m.group(2).strip()
 
@@ -2112,6 +2165,15 @@ def set_customer_package(customer_key, new_pkg):
 def handle_customer_message(message):
     if message.content_type != 'text' or not (message.text or "").strip():
         return
+
+    # "<visitor id> has left" (id = 6-9 random alphanumerics): halt any pending approval and
+    # forget this visitor entirely so a return starts fresh. Must run BEFORE the generic
+    # service-message check below, which would only cancel the pending approval.
+    left_m = VISITOR_LEFT_RE.match(message.text)
+    if left_m:
+        handle_visitor_left(message, left_m.group("tag"))
+        return
+
     if is_service_message(message.text):
         cancel_pending_for_customer(make_customer_key(message))
         return
@@ -2545,7 +2607,8 @@ def handle_customer_left(message):
     if not left_user:
         return
     customer_key = f"{message.chat.id}:{left_user.id}"
-    cancel_pending_for_customer(customer_key)
+    forget_customer(customer_key)
+    save_state()
 
 
 # ==========================================
@@ -3030,11 +3093,12 @@ def run_admin_bot():
 
 if __name__ == "__main__":
     import sys
-    print("[VERSION] splash_bot.py — merged auto-approval (core-ref matching, no phone/package interrogation on auto-approve) + smart payment fast-path + auto stock reservation + YES-on-unreserved fix + Intergram reconnect (tag-first, phone-fallback) + pre-registered proof auto-approval + where-to-pay auto-reply + specific mismatch reasons in admin notes + logout-message suppression", flush=True)
+    print("[VERSION] splash_bot.py — merged auto-approval (core-ref matching, partial-reference auto-approval, no phone/package interrogation on auto-approve) + smart payment fast-path + auto stock reservation + YES-on-unreserved fix + Intergram reconnect (tag-first, phone-fallback, 6-9 char tags) + pre-registered proof auto-approval + where-to-pay auto-reply + specific mismatch reasons in admin notes + logout-message suppression + visitor-left forget", flush=True)
     load_state()
     print(f"[Groq] Loaded {len(groq_clients)} API key(s) for rotation/fallback.", flush=True)
     print(f"[AUTO] Auto-approval {'ENABLED' if AUTO_APPROVE_ENABLED else 'DISABLED'} "
-          f"({len(registered_proofs)} registered proof(s) loaded).", flush=True)
+          f"(partial references {'ENABLED' if AUTO_APPROVE_PARTIAL else 'DISABLED'}, "
+          f"{len(registered_proofs)} registered proof(s) loaded).", flush=True)
     print(f"[SMS] Webhook /sms {'ENABLED' if SMS_WEBHOOK_SECRET else 'DISABLED (set SMS_WEBHOOK_SECRET to enable)'}.", flush=True)
     Thread(target=run_customer_bot).start()
     Thread(target=run_admin_bot).start()
